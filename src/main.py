@@ -22,7 +22,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "src.main:app",
-        host=settings.host,
-        port=settings.port,
+        host=settings.app_host,
+        port=settings.app_port,
         reload=settings.app_env == "development",
     )
