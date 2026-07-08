@@ -117,7 +117,7 @@ async def retrieval_agent(prompt: str) -> SubAgentResult:
     try:
         # Connect directly to SyntraFlow retrieval engine if running in same monorepo
         from projects.syntraflow.src.retrieval import RetrievalEngine
-        from projects.syntraflow.src.vectors.client import VectorClient
+        from common.clients.qdrant import VectorClient
         
         vector = VectorClient()
         engine = RetrievalEngine(vector)
