@@ -28,8 +28,11 @@ from projects.guardroute.src.agents.guardrails import (
     scrub_pii,
     check_toxicity,
     clean_html_tags,
+    check_hallucination_grounding,
 )
 from projects.guardroute.src.agents.classifier import classify_prompt
+from common.models.registry import get_active_model
+
 
 logger = logging.getLogger("guardroute.orchestrator")
 
@@ -274,6 +277,27 @@ async def execute_orchestrator_stream(prompt: str, session_id: Optional[str] = N
 
     # 1. Pre-flight Guardrails and sanitization
     clean_prompt = clean_html_tags(prompt)
+
+    # Enforce max prompt length based on completion model context window
+    context_window = 1048576  # Default fallback
+    try:
+        model_spec = await get_active_model("completion")
+        context_window = model_spec.context_window or 1048576
+    except Exception:
+        pass
+
+    # Estimate prompt tokens (approx 1 token = 4 characters)
+    estimated_tokens = len(clean_prompt) // 4
+    # Reserve 2000 tokens for system prompt and responses
+    max_allowed = max(1000, context_window - 2000)
+    if estimated_tokens > max_allowed:
+        logger.warning("Pre-flight rejection: prompt length %d exceeds max allowed %d", estimated_tokens, max_allowed)
+        yield {
+            "event": "error",
+            "data": json.dumps({"detail": f"Prompt rejected: exceeds maximum length of {max_allowed} tokens."})
+        }
+        return
+
     is_safe, err_msg = check_prompt_injection(clean_prompt)
     if not is_safe:
         logger.warning("Pre-flight rejection: prompt injection detected.")
@@ -394,9 +418,40 @@ async def execute_orchestrator_stream(prompt: str, session_id: Optional[str] = N
     # Post-flight guardrails (PII and toxicity)
     synthesized_ans = "".join(ans_accum)
     scrubbed_ans = scrub_pii(synthesized_ans)
-    
-    # 7. Update Redis Conversation Cache
-    history.append({"role": "user", "content": clean_prompt})
+
+    # 1. Toxicity check
+    toxicity_threshold = getattr(settings, "TOXICITY_THRESHOLD", 0.1)
+    toxicity_score = check_toxicity(scrubbed_ans)
+    if toxicity_score > toxicity_threshold:
+        logger.warning(
+            "Post-flight rejection: toxicity score %.2f exceeds threshold %.2f",
+            toxicity_score, toxicity_threshold
+        )
+        yield {
+            "event": "error",
+            "data": json.dumps({"detail": "Response rejected: security policy violation (toxic content detected)."})
+        }
+        return
+
+    # 2. Hallucination grounding check (for successful retrieval results)
+    retrieved_contexts = [
+        r.content for r in final_state["subagent_results"]
+        if r.source == "retrieval" and r.status == SubAgentStatus.SUCCESS
+    ]
+    if retrieved_contexts:
+        context_str = "\n\n".join(retrieved_contexts)
+        is_grounded, grounding_err = await check_hallucination_grounding(scrubbed_ans, context_str)
+        if not is_grounded:
+            logger.warning("Post-flight rejection: hallucination grounding check failed.")
+            yield {
+                "event": "error",
+                "data": json.dumps({"detail": grounding_err})
+            }
+            return
+
+    # 7. Update Redis Conversation Cache (and scrub prompt of PII first)
+    scrubbed_prompt = scrub_pii(clean_prompt)
+    history.append({"role": "user", "content": scrubbed_prompt})
     history.append({"role": "assistant", "content": scrubbed_ans})
     if redis:
         try:
@@ -412,9 +467,11 @@ async def execute_orchestrator_stream(prompt: str, session_id: Optional[str] = N
     if not completion_tokens:
         completion_tokens = len(scrubbed_ans) // 4
 
+    # Scrub PII from the user prompt inside the Kafka / Postgres trace payload
+    scrubbed_trace_prompt = scrub_pii(prompt)
     trace = {
         "session_id": session_id,
-        "prompt": prompt,
+        "prompt": scrubbed_trace_prompt,
         "complexity": final_state["complexity"],
         "subagents_ran": final_state["required_agents"],
         "final_response": scrubbed_ans,
@@ -446,7 +503,10 @@ async def execute_orchestrator(prompt: str, session_id: Optional[str] = None) ->
     async for event in execute_orchestrator_stream(prompt, session_id):
         if event["event"] == "metadata":
             trace_res.update(json.loads(event["data"]))
+        elif event["event"] == "error":
+            raise ValueError(json.loads(event["data"]).get("detail", "Request failed security policy."))
         elif event["event"] == "done":
             trace_res.update(json.loads(event["data"]))
             trace_res["final_response"] = trace_res.get("response")
     return trace_res
+

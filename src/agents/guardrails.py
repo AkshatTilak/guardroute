@@ -84,3 +84,47 @@ def check_toxicity(text: str, threshold: float = 0.1) -> float:
     score = matches / len(words)
     # Cap score at 1.0
     return min(score * 10.0, 1.0)
+
+
+async def check_hallucination_grounding(response: str, context: str) -> Tuple[bool, Optional[str]]:
+    """Verify that the response is grounded in the retrieved context using the active completion model.
+    
+    Returns:
+        (is_grounded, error_message)
+    """
+    if not context or not context.strip():
+        return True, None
+
+    prompt = (
+        "You are a Hallucination Grounding Validator.\n"
+        "Analyze the following Response and Context. Determine if the Response is fully grounded in and supported by the Context.\n"
+        "If there are statements in the Response that contradict or cannot be inferred from the Context, mark it as ungrounded.\n"
+        "Respond with EXACTLY 'GROUNDED' or 'UNGROUNDED' on the first line, followed by a brief reason.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Response:\n{response}"
+    )
+
+    try:
+        from common.clients.litellm import completion_with_fallback
+        from common.models.registry import get_active_model
+
+        model_spec = await get_active_model("completion")
+        model_name = model_spec.model_id
+
+        res = await completion_with_fallback(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False
+        )
+        content = res.choices[0].message.content.strip()
+        if content.upper().startswith("UNGROUNDED"):
+            # Extract reason if present after newline/spaces
+            reason = content[10:].strip()
+            if reason.startswith(":") or reason.startswith("-"):
+                reason = reason[1:].strip()
+            return False, f"Response rejected: failed hallucination grounding check. Reason: {reason or 'Response not supported by retrieved context.'}"
+        return True, None
+    except Exception as e:
+        logger.warning("Failed to run hallucination grounding check: %s. Assuming grounded.", e)
+        return True, None
+
