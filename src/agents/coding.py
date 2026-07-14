@@ -10,6 +10,7 @@ import math
 import json
 import threading
 import queue
+import time
 from typing import Any, Dict
 from RestrictedPython import compile_restricted, safe_builtins
 from RestrictedPython.PrintCollector import PrintCollector
@@ -86,6 +87,13 @@ async def run_code_sandbox(code: str, timeout: float = 10.0) -> SubAgentResult:
     """Runs Python code block in RestrictedPython sandbox with timeout limit."""
     pc = PrintCollector()
     result_queue = queue.Queue()
+    start_time = time.time()
+
+    try:
+        from common.observability.logger import log_security_event
+        log_security_event("SANDBOX_EXECUTION_ATTEMPT", {"code_length": len(code), "timeout": timeout})
+    except Exception:
+        pass
 
     # Run execution in a separate daemon thread to enforce timeout
     thread = threading.Thread(
@@ -104,6 +112,7 @@ async def run_code_sandbox(code: str, timeout: float = 10.0) -> SubAgentResult:
         return not thread.is_alive()
         
     completed_in_time = await loop.run_in_executor(None, wait_on_thread)
+    latency_ms = (time.time() - start_time) * 1000.0
     
     # Accumulate prints
     printed_lines = pc.txt
@@ -112,6 +121,13 @@ async def run_code_sandbox(code: str, timeout: float = 10.0) -> SubAgentResult:
     if not completed_in_time:
         # Thread timed out
         timeout_msg = f"Execution Timeout: code execution exceeded {timeout}s limit."
+        try:
+            log_security_event(
+                "SANDBOX_EXECUTION_RESULT",
+                {"status": "TIMEOUT", "latency_ms": latency_ms, "error_message": timeout_msg}
+            )
+        except Exception:
+            pass
         return SubAgentResult(
             source="coding",
             status=SubAgentStatus.TIMEOUT,
@@ -128,11 +144,19 @@ async def run_code_sandbox(code: str, timeout: float = 10.0) -> SubAgentResult:
         err = RuntimeError("No result returned from sandbox executor")
 
     if not success:
+        err_msg = f"Runtime Error: {str(err)}"
+        try:
+            log_security_event(
+                "SANDBOX_EXECUTION_RESULT",
+                {"status": "ERROR", "latency_ms": latency_ms, "error_message": err_msg}
+            )
+        except Exception:
+            pass
         return SubAgentResult(
             source="coding",
             status=SubAgentStatus.ERROR,
             content=stdout_output,
-            error_message=f"Runtime Error: {str(err)}",
+            error_message=err_msg,
             token_count=0
         )
 
@@ -140,6 +164,14 @@ async def run_code_sandbox(code: str, timeout: float = 10.0) -> SubAgentResult:
     # Truncate content to 10,000 characters
     if len(content_str) > 10000:
         content_str = content_str[:10000] + "\n... [Output Truncated due to size limits]"
+
+    try:
+        log_security_event(
+            "SANDBOX_EXECUTION_RESULT",
+            {"status": "SUCCESS", "latency_ms": latency_ms}
+        )
+    except Exception:
+        pass
 
     return SubAgentResult(
         source="coding",

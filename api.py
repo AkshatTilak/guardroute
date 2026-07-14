@@ -9,7 +9,7 @@ import logging
 from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from sse_starlette.event_source import EventSourceResponse
+from sse_starlette.sse import EventSourceResponse
 
 from projects.guardroute.src.orchestrator import (
     execute_orchestrator,

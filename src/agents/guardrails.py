@@ -50,6 +50,11 @@ def check_prompt_injection(prompt: str) -> Tuple[bool, Optional[str]]:
     for regex in INJECTION_REGEXES:
         if regex.search(prompt):
             logger.warning("Prompt injection attempt detected: matched pattern '%s'", regex.pattern)
+            try:
+                from common.observability.logger import log_security_event
+                log_security_event("PROMPT_INJECTION_DETECTED", {"matched_pattern": regex.pattern, "prompt_snippet": prompt[:100]})
+            except Exception as e:
+                logger.error("Failed to log prompt injection security event: %s", e)
             return False, "Prompt rejected: security policy violation (suspicious injection pattern detected)."
             
     return True, None

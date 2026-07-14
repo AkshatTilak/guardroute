@@ -510,3 +510,9 @@ async def execute_orchestrator(prompt: str, session_id: Optional[str] = None) ->
             trace_res["final_response"] = trace_res.get("response")
     return trace_res
 
+
+async def run_classification(prompt: str, inference_client: InferenceClient) -> Dict[str, Any]:
+    """Wrapper calling the unified classifier agent."""
+    from projects.guardroute.src.agents.classifier import classify_prompt
+    return await classify_prompt(prompt, inference_client)
+
