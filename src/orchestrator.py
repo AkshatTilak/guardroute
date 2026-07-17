@@ -506,20 +506,32 @@ async def execute_orchestrator_stream(prompt: str, session_id: Optional[str] = N
 
 async def execute_orchestrator(prompt: str, session_id: Optional[str] = None) -> Dict[str, Any]:
     """Execute orchestrator pipeline and return accumulated final trace result."""
-    trace_res = {}
-    async for event in execute_orchestrator_stream(prompt, session_id):
-        if event["event"] == "metadata":
-            trace_res.update(json.loads(event["data"]))
-        elif event["event"] == "error":
-            raise ValueError(json.loads(event["data"]).get("detail", "Request failed security policy."))
-        elif event["event"] == "done":
-            trace_res.update(json.loads(event["data"]))
-            trace_res["final_response"] = trace_res.get("response")
-    return trace_res
+    from opentelemetry import trace
+    tracer = trace.get_tracer("guardroute")
+    with tracer.start_as_current_span("guardroute.orchestrator") as span:
+        span.set_attribute("session_id", session_id or "")
+        trace_res = {}
+        async for event in execute_orchestrator_stream(prompt, session_id):
+            if event["event"] == "metadata":
+                trace_res.update(json.loads(event["data"]))
+            elif event["event"] == "error":
+                raise ValueError(json.loads(event["data"]).get("detail", "Request failed security policy."))
+            elif event["event"] == "done":
+                trace_res.update(json.loads(event["data"]))
+                trace_res["final_response"] = trace_res.get("response")
+        if "complexity" in trace_res:
+            span.set_attribute("complexity", trace_res["complexity"])
+        return trace_res
 
 
 async def run_classification(prompt: str, inference_client: InferenceClient) -> Dict[str, Any]:
     """Wrapper calling the unified classifier agent."""
-    from projects.guardroute.src.agents.classifier import classify_prompt
-    return await classify_prompt(prompt, inference_client)
+    from opentelemetry import trace
+    tracer = trace.get_tracer("guardroute")
+    with tracer.start_as_current_span("guardroute.classify") as span:
+        from projects.guardroute.src.agents.classifier import classify_prompt
+        res = await classify_prompt(prompt, inference_client)
+        if "complexity" in res:
+            span.set_attribute("complexity", res["complexity"])
+        return res
 
