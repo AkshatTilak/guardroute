@@ -78,6 +78,13 @@ def publish_trace_to_kafka(trace_data: Dict[str, Any]) -> None:
         logger.info("Trace event successfully published to Kafka: guardroute-traces")
     except Exception as e:
         logger.warning("Kafka broker unavailable: %s. Trace logged locally.", e)
+        try:
+            import os
+            os.makedirs("logs", exist_ok=True)
+            with open("logs/guardroute_traces.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(trace_data) + "\n")
+        except Exception as write_err:
+            logger.error("Failed to write trace locally: %s", write_err)
 
 
 async def persist_session_and_usage(trace_data: Dict[str, Any], input_tokens: int, output_tokens: int) -> None:

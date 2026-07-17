@@ -16,6 +16,7 @@ from projects.guardroute.src.orchestrator import (
     execute_orchestrator_stream,
     run_classification
 )
+from common.clients.inference import InferenceServerError
 
 router = APIRouter(tags=["guardroute"])
 logger = logging.getLogger("guardroute.api")
@@ -92,6 +93,9 @@ async def classify_task(request: Request, req: ChatRequest) -> dict:
             "required_agents": result.get("required_agents"),
             "confidence": result.get("confidence", 1.0)
         }
+    except InferenceServerError as e:
+        logger.error("Inference server error during classification: %s", e)
+        raise HTTPException(status_code=503, detail=f"Inference server is currently offline: {str(e)}")
     except Exception as e:
         logger.error("Intent classification failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Classification query failed: {str(e)}")
