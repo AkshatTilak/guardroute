@@ -99,3 +99,149 @@ async def classify_task(request: Request, req: ChatRequest) -> dict:
     except Exception as e:
         logger.error("Intent classification failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Classification query failed: {str(e)}")
+
+
+# --- V2 Visual Workflow CRUD REST APIs ---
+
+import uuid
+from datetime import datetime
+from typing import List
+from fastapi import Depends
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from common.clients.postgres import get_async_db
+from common.models.database import WorkflowDefinition
+from projects.guardroute.src.core.graph_parser import GraphParser, GraphValidationError
+
+
+class WorkflowCreatePayload(BaseModel):
+    name: str
+    graph_json: Dict[str, Any]
+    is_active: Optional[bool] = False
+
+
+class WorkflowResponse(BaseModel):
+    id: str
+    name: str
+    graph_json: Dict[str, Any]
+    is_active: bool
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+def _to_iso(dt: Any) -> Optional[str]:
+    if not dt:
+        return None
+    if isinstance(dt, str):
+        return dt
+    if hasattr(dt, "isoformat"):
+        val = dt.isoformat()
+        if isinstance(val, str):
+            return val
+    return str(dt)
+
+
+@router.get("/workflows", response_model=List[WorkflowResponse])
+async def list_workflows(db: AsyncSession = Depends(get_async_db)) -> List[WorkflowResponse]:
+    """Retrieve all saved visual workflow graph configurations."""
+    stmt = select(WorkflowDefinition).order_by(WorkflowDefinition.created_at.desc())
+    res = await db.execute(stmt)
+    workflows = res.scalars().all()
+    return [
+        WorkflowResponse(
+            id=w.id,
+            name=w.name,
+            graph_json=w.graph_json,
+            is_active=w.is_active,
+            created_at=_to_iso(w.created_at),
+            updated_at=_to_iso(w.updated_at)
+        )
+        for w in workflows
+    ]
+
+
+@router.post("/workflows", response_model=WorkflowResponse)
+async def create_workflow(
+    payload: WorkflowCreatePayload,
+    db: AsyncSession = Depends(get_async_db)
+) -> WorkflowResponse:
+    """Save/create a visual workflow graph definition after validating topology."""
+    parser = GraphParser()
+    try:
+        parser.validate_graph(payload.graph_json)
+    except GraphValidationError as ve:
+        raise HTTPException(status_code=400, detail=f"Invalid graph topology: {str(ve)}")
+
+    if payload.is_active:
+        # Deactivate all existing workflows if this one is set to active
+        await db.execute(update(WorkflowDefinition).values(is_active=False))
+
+    workflow = WorkflowDefinition(
+        id=str(uuid.uuid4()),
+        name=payload.name,
+        graph_json=payload.graph_json,
+        is_active=payload.is_active or False
+    )
+    db.add(workflow)
+    await db.commit()
+    await db.refresh(workflow)
+
+    return WorkflowResponse(
+        id=workflow.id,
+        name=workflow.name,
+        graph_json=workflow.graph_json,
+        is_active=workflow.is_active,
+        created_at=_to_iso(workflow.created_at),
+        updated_at=_to_iso(workflow.updated_at)
+    )
+
+
+@router.put("/workflows/{workflow_id}/activate", response_model=WorkflowResponse)
+async def activate_workflow(
+    workflow_id: str,
+    db: AsyncSession = Depends(get_async_db)
+) -> WorkflowResponse:
+    """Activates a workflow and deactivates all others."""
+    stmt = select(WorkflowDefinition).filter(WorkflowDefinition.id == workflow_id)
+    res = await db.execute(stmt)
+    workflow = res.scalar_one_or_none()
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail=f"Workflow with ID '{workflow_id}' not found.")
+
+    # Deactivate all workflows
+    await db.execute(update(WorkflowDefinition).values(is_active=False))
+    workflow.is_active = True
+    workflow.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(workflow)
+
+    return WorkflowResponse(
+        id=workflow.id,
+        name=workflow.name,
+        graph_json=workflow.graph_json,
+        is_active=workflow.is_active,
+        created_at=_to_iso(workflow.created_at),
+        updated_at=_to_iso(workflow.updated_at)
+    )
+
+
+@router.get("/workflows/active", response_model=Optional[WorkflowResponse])
+async def get_active_workflow(db: AsyncSession = Depends(get_async_db)) -> Optional[WorkflowResponse]:
+    """Retrieve the currently active visual workflow configuration."""
+    stmt = select(WorkflowDefinition).filter(WorkflowDefinition.is_active == True).limit(1)
+    res = await db.execute(stmt)
+    workflow = res.scalar_one_or_none()
+
+    if not workflow:
+        return None
+
+    return WorkflowResponse(
+        id=workflow.id,
+        name=workflow.name,
+        graph_json=workflow.graph_json,
+        is_active=workflow.is_active,
+        created_at=_to_iso(workflow.created_at),
+        updated_at=_to_iso(workflow.updated_at)
+    )
+
