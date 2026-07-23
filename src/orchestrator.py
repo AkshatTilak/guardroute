@@ -47,6 +47,13 @@ class GraphState(TypedDict):
     subagent_results: Annotated[List[SubAgentResult], operator.add]
     final_response: str
     token_usage: Dict[str, int]  # Keys: input, output
+    # V5 extensions:
+    webhook_results: Dict[str, Any]
+    api_call_results: Dict[str, Any]
+    eval_results: Dict[str, Any]
+    transform_outputs: Dict[str, Any]
+    mcp_tool_results: Dict[str, Any]
+    conditional_flags: Dict[str, bool]
 
 
 # --- Helper to retrieve Redis and DB connection ---
@@ -234,11 +241,19 @@ async def gather_node(state: GraphState) -> Dict[str, Any]:
     return {}
 
 
-# --- LangGraph Construction ---
+try:
+    from langgraph.graph import StateGraph, START, END
+    HAS_LANGGRAPH = True
+except ModuleNotFoundError:
+    StateGraph = Any
+    START = "START"
+    END = "END"
+    HAS_LANGGRAPH = False
 
-from langgraph.graph import StateGraph, START, END
-
-def create_orchestrator_graph() -> StateGraph:
+def create_orchestrator_graph() -> Any:
+    if not HAS_LANGGRAPH:
+        logger.warning("LangGraph library not installed; create_orchestrator_graph() returning None.")
+        return None
     workflow = StateGraph(GraphState)
     
     workflow.add_node("classify", classify_node)

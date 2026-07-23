@@ -6,7 +6,12 @@ Queries DuckDuckGo search engine to collect live context from the web.
 import asyncio
 import logging
 from typing import List, Dict, Any
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search import DDGS
+    HAS_DDGS = True
+except ModuleNotFoundError:
+    HAS_DDGS = False
+    DDGS = None
 
 from common.schemas.agent_types import SubAgentResult, SubAgentStatus
 

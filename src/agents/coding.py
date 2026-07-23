@@ -12,15 +12,22 @@ import threading
 import queue
 import time
 from typing import Any, Dict
-from RestrictedPython import compile_restricted, safe_builtins
-from RestrictedPython.PrintCollector import PrintCollector
-from RestrictedPython.Guards import (
-    safe_builtins as guard_builtins,
-    safer_getattr,
-    guarded_setattr,
-    guarded_delattr,
-    guarded_iter_unpack_sequence,
-)
+try:
+    from RestrictedPython import compile_restricted, safe_builtins
+    from RestrictedPython.PrintCollector import PrintCollector
+    from RestrictedPython.Guards import (
+        safe_builtins as guard_builtins,
+        safer_getattr,
+        guarded_setattr,
+        guarded_delattr,
+        guarded_iter_unpack_sequence,
+    )
+    HAS_RESTRICTED_PYTHON = True
+except ModuleNotFoundError:
+    HAS_RESTRICTED_PYTHON = False
+    compile_restricted = None
+    safe_builtins = {}
+    PrintCollector = None
 
 from common.schemas.agent_types import SubAgentResult, SubAgentStatus
 
