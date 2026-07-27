@@ -2,12 +2,13 @@
 
 Converts ReactFlow visual graph JSON configurations (nodes, edges, node parameters)
 into compiled, executable LangGraph StateGraph dynamic workflows with topology validation.
-Supports V5 node types: Classifier, Agent, Retrieval, Coding, WebSearch, Synthesis, Gather,
-IfElse, Webhook, APICall, Eval, MCPTool, Router, Transform.
+Supports V5 node types: Classifier, Agent, MultiAgent, Retrieval, Coding, WebSearch, Synthesis, Gather,
+Action, FinalMessage, IfElse, Webhook, APICall, Eval, MCPTool, Router, Transform.
 """
 
 import logging
 from typing import Any, Dict, List, Optional, Set
+
 try:
     from langgraph.graph import StateGraph, START, END
     HAS_LANGGRAPH = True
@@ -17,12 +18,16 @@ except ModuleNotFoundError:
             self.nodes = {}
             self.edges = []
             self.entry_point = None
+
         def add_node(self, node_id, action):
             self.nodes[node_id] = action
+
         def add_edge(self, src, tgt):
             self.edges.append((src, tgt))
+
         def set_entry_point(self, entry_id):
             self.entry_point = entry_id
+
         def compile(self):
             return self
 
@@ -30,6 +35,7 @@ except ModuleNotFoundError:
     START = "START"
     END = "END"
     HAS_LANGGRAPH = False
+
 from projects.guardroute.src.orchestrator import (
     GraphState,
     classify_node,
@@ -45,6 +51,9 @@ from projects.guardroute.src.nodes.eval_executor import execute_eval_node
 from projects.guardroute.src.nodes.mcp_tool_executor import execute_mcp_tool
 from projects.guardroute.src.nodes.router_executor import evaluate_routes
 from projects.guardroute.src.nodes.transform_executor import execute_transform
+from projects.guardroute.src.nodes.multi_agent_executor import execute_multi_agent
+from projects.guardroute.src.nodes.action_executor import execute_action_node
+from projects.guardroute.src.nodes.final_message_executor import execute_final_message_node
 
 logger = logging.getLogger("guardroute.core.graph_parser")
 
@@ -58,14 +67,17 @@ class GraphParser:
     """Parses ReactFlow graph JSON and builds executable LangGraph StateGraph instances."""
 
     SUPPORTED_NODE_TYPES = {
-        # Core V2
+        # Core V2 & Multi-Agent V5
         "ClassifierNode", "classifier",
         "AgentNode", "agent",
+        "MultiAgentNode", "multi_agent",
         "RetrievalNode", "retrieval",
         "CodingNode", "coding",
         "WebSearchNode", "web_search",
         "SynthesisNode", "synthesis",
         "GatherNode", "gather",
+        "ActionNode", "action",
+        "FinalMessageNode", "final_message",
         # Logic V5
         "IfElseNode", "if_else",
         "RouterNode", "router",
@@ -79,6 +91,13 @@ class GraphParser:
         "MCPToolNode", "mcp_tool"
     }
 
+    TERMINAL_NODE_TYPES = {
+        "ActionNode", "action",
+        "FinalMessageNode", "final_message",
+        "SynthesisNode", "synthesis",
+        "GatherNode", "gather",
+    }
+
     def __init__(self, graph_json: Optional[Dict[str, Any]] = None):
         self.graph_json = graph_json or {}
 
@@ -86,10 +105,11 @@ class GraphParser:
         """Validates ReactFlow JSON topology for safety constraints.
 
         Constraints enforced:
-        - Must contain non-empty 'nodes' and 'edges' lists.
+        - Must contain non-empty 'nodes' list.
         - All edges must reference valid node IDs.
-        - Must contain at least one terminal node (SynthesisNode/GatherNode or leaf node).
         - Must not contain cycles (directed acyclic graph constraint for safety).
+        - **Rule 8 Strict Terminal Constraint:** All execution paths must end in an approved terminal node
+          (ActionNode, FinalMessageNode, or SynthesisNode/GatherNode).
         """
         data = graph_json or self.graph_json
         nodes = data.get("nodes", [])
@@ -98,7 +118,8 @@ class GraphParser:
         if not nodes:
             raise GraphValidationError("Workflow graph must contain at least one node.")
 
-        node_ids = {node["id"] for node in nodes if "id" in node}
+        node_map = {node["id"]: node for node in nodes if "id" in node}
+        node_ids = set(node_map.keys())
 
         # Check edge validity
         adj: Dict[str, List[str]] = {nid: [] for nid in node_ids}
@@ -128,6 +149,20 @@ class GraphParser:
         if visited_count < len(node_ids):
             raise GraphValidationError("Workflow graph contains an infinite cycle. Workflows must be acyclic.")
 
+        # --- Rule 8 Validation Check ---
+        # Find all leaf nodes (nodes with 0 outgoing edges)
+        all_sources = {e.get("source") for e in edges}
+        leaf_ids = [nid for nid in node_ids if nid not in all_sources]
+
+        for leaf_id in leaf_ids:
+            leaf_node = node_map[leaf_id]
+            ntype = leaf_node.get("type", "AgentNode")
+            if ntype not in self.TERMINAL_NODE_TYPES:
+                raise GraphValidationError(
+                    f"Rule 8 Violation: Path terminates at non-terminal node '{leaf_id}' of type '{ntype}'. "
+                    "Every workflow path MUST conclude in an ActionNode, FinalMessageNode, or SynthesisNode."
+                )
+
         return True
 
     def build_langgraph(self, graph_json: Optional[Dict[str, Any]] = None) -> Any:
@@ -138,7 +173,7 @@ class GraphParser:
             from projects.guardroute.src.orchestrator import create_orchestrator_graph
             return create_orchestrator_graph()
 
-        # Validate topology
+        # Validate topology (enforces Rule 8 terminal constraint & cycle checks)
         self.validate_graph(data)
 
         nodes = data.get("nodes", [])
@@ -147,12 +182,13 @@ class GraphParser:
         workflow = StateGraph(GraphState)
         node_map = {}
         entry_node_id = None
-        gather_node_ids = set()
+        terminal_node_ids = set()
 
         for node in nodes:
             nid = node["id"]
             ntype = node.get("type", "AgentNode")
             data_cfg = node.get("data", {})
+            data_cfg["node_id"] = nid
 
             if ntype in {"ClassifierNode", "classifier"}:
                 workflow.add_node(nid, classify_node)
@@ -166,7 +202,26 @@ class GraphParser:
                 workflow.add_node(nid, web_search_node)
             elif ntype in {"SynthesisNode", "GatherNode", "synthesis", "gather"}:
                 workflow.add_node(nid, gather_node)
-                gather_node_ids.add(nid)
+                terminal_node_ids.add(nid)
+
+            # V5 Multi-Agent Node
+            elif ntype in {"MultiAgentNode", "multi_agent"}:
+                async def _multi_agent_fn(state: GraphState, cfg=data_cfg):
+                    return await execute_multi_agent(cfg, state)
+                workflow.add_node(nid, _multi_agent_fn)
+
+            # V5 Terminal Nodes
+            elif ntype in {"ActionNode", "action"}:
+                async def _action_fn(state: GraphState, cfg=data_cfg):
+                    return await execute_action_node(cfg, state)
+                workflow.add_node(nid, _action_fn)
+                terminal_node_ids.add(nid)
+
+            elif ntype in {"FinalMessageNode", "final_message"}:
+                async def _final_message_fn(state: GraphState, cfg=data_cfg):
+                    return await execute_final_message_node(cfg, state)
+                workflow.add_node(nid, _final_message_fn)
+                terminal_node_ids.add(nid)
 
             # V5 Logic Nodes
             elif ntype in {"IfElseNode", "if_else"}:
@@ -250,11 +305,11 @@ class GraphParser:
             if src in node_map and tgt in node_map:
                 workflow.add_edge(src, tgt)
 
-        # Connect gather/terminal nodes to END
-        for g_id in gather_node_ids:
-            workflow.add_edge(g_id, END)
+        # Connect terminal nodes to END
+        for t_id in terminal_node_ids:
+            workflow.add_edge(t_id, END)
 
-        if not gather_node_ids:
+        if not terminal_node_ids:
             all_sources = {e.get("source") for e in edges}
             leaves = [nid for nid in node_map if nid not in all_sources]
             for leaf in leaves:
