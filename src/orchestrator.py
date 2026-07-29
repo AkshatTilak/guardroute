@@ -166,38 +166,21 @@ async def retrieval_agent(prompt: str) -> SubAgentResult:
     """Retrieves context from SyntraFlow Hybrid Retrieval Engine."""
     try:
         from projects.syntraflow.src.retrieval import RetrievalEngine
-        from common.clients.qdrant import VectorClient
-        
-        vector = VectorClient()
-        engine = RetrievalEngine(vector)
-        
-        # Resolve active embedding model dimension and embed prompt
-        dim = 1024
-        try:
-            model_spec = await get_active_model("embedding")
-            dim = model_spec.vector_dim or 1024
-        except Exception:
-            pass
+        from common.clients.postgres import get_sessionmaker
+        SessionLocal = get_sessionmaker()
 
-        try:
-            inference = InferenceClient(base_url=settings.INFERENCE_SERVER_URL)
-            embeds = await inference.embed(texts=[prompt])
-            query_vector = embeds[0]
-            await inference.close()
-        except Exception:
-            logger.warning("Inference Server embed failed. Falling back to zero query vector.")
-            query_vector = [0.0] * dim
-
-        results = await engine.search_hybrid(prompt, query_vector, limit=3)
-        content_str = json.dumps(results, indent=2)
-        
-        return SubAgentResult(
-            source="retrieval",
-            status=SubAgentStatus.SUCCESS,
-            content_type="json",
-            content=content_str,
-            token_count=len(content_str) // 4
-        )
+        async with SessionLocal() as db:
+            engine = RetrievalEngine(db, "default")
+            results = await engine.search(query=prompt, limit=3)
+            content_str = json.dumps(results, indent=2)
+            
+            return SubAgentResult(
+                source="retrieval",
+                status=SubAgentStatus.SUCCESS,
+                content_type="json",
+                content=content_str,
+                token_count=len(content_str) // 4
+            )
     except Exception as e:
         logger.error("Retrieval subagent logic failed: %s", e)
         return SubAgentResult(
