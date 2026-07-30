@@ -1,0 +1,66 @@
+{
+  "format": "contained.workflow/v6",
+  "exported_at": "2026-07-30T00:00:00Z",
+  "source": {
+    "hub_id": "default-hub",
+    "hub_slug": "default-hub",
+    "hub_type": "workflow"
+  },
+  "workflow": {
+    "name": "Classify & Route",
+    "slug": "classify-and-route",
+    "description": "Classify input and conditionally route logic",
+    "tags": ["routing"]
+  },
+  "version": {
+    "version_number": 1,
+    "change_note": "Initial template",
+    "graph": {
+      "nodes": [
+        {
+          "id": "n1",
+          "type": "ClassifierNode",
+          "data": { "label": "Classify" }
+        },
+        {
+          "id": "n2",
+          "type": "IfElseNode",
+          "data": { "label": "Branch Condition" }
+        },
+        {
+          "id": "n3",
+          "type": "AgentNode",
+          "data": {
+            "label": "Primary Agent",
+            "reference": {
+              "type": "agent",
+              "hub_id": "default-hub",
+              "resource_id": "agt_primary"
+            }
+          }
+        },
+        {
+          "id": "n4",
+          "type": "FinalMessageNode",
+          "data": { "label": "Output" }
+        }
+      ],
+      "edges": [
+        { "source": "n1", "target": "n2" },
+        { "source": "n2", "target": "n3" },
+        { "source": "n3", "target": "n4" }
+      ],
+      "viewport": {}
+    }
+  },
+  "dependencies": [
+    {
+      "ref_key": "agent:agt_primary",
+      "type": "agent",
+      "source_hub_id": "default-hub",
+      "resource_id": "agt_primary",
+      "resource_slug": "primary-agent",
+      "node_ids": ["n3"]
+    }
+  ]
+}

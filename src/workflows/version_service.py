@@ -55,6 +55,11 @@ class HubArchivedError(Exception):
     pass
 
 
+class VersionNotFoundError(Exception):
+    """Raised when a specific version number is not found for a workflow."""
+    pass
+
+
 @dataclass
 class NodeChange:
     node_id: str
@@ -475,3 +480,163 @@ async def list_versions(session: AsyncSession, *, hub_id: str, workflow_id: str)
         .order_by(WorkflowVersion.version_number.asc())
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def list_workflows(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    q: Optional[str] = None,
+    tag: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[WorkflowDefinition]:
+    """List workflows within the hub with filtering and pagination."""
+    await _get_hub(session, hub_id)
+    stmt = select(WorkflowDefinition).where(WorkflowDefinition.hub_id == hub_id)
+    if q:
+        stmt = stmt.where(WorkflowDefinition.name.ilike(f"%{q}%"))
+    if status:
+        stmt = stmt.where(WorkflowDefinition.status == status)
+    stmt = stmt.order_by(WorkflowDefinition.updated_at.desc()).limit(limit).offset(offset)
+    wfs = (await session.execute(stmt)).scalars().all()
+    results = []
+    for wf in wfs:
+        if tag and tag not in (wf.tags_json or []):
+            continue
+        results.append(wf)
+    return results
+
+
+async def create_workflow(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    payload: Any,
+    actor_id: str,
+) -> WorkflowDefinition:
+    """Create a new WorkflowDefinition with draft v1."""
+    hub = await _get_hub(session, hub_id)
+    if hub.is_archived:
+        raise HubArchivedError(f"Cannot create workflow: Hub '{hub_id}' is archived.")
+
+    name = payload.name
+    slug = payload.slug or _slugify(name)
+    stmt_chk = select(WorkflowDefinition).where(
+        WorkflowDefinition.hub_id == hub_id,
+        WorkflowDefinition.slug == slug,
+    )
+    if (await session.execute(stmt_chk)).scalar_one_or_none():
+        raise ValueError(f"WORKFLOW_SLUG_TAKEN: Workflow with slug '{slug}' already exists in hub.")
+
+    wf_id = str(uuid.uuid4())
+    wf = WorkflowDefinition(
+        id=wf_id,
+        hub_id=hub_id,
+        name=name,
+        slug=slug,
+        description=getattr(payload, "description", None),
+        tags_json=getattr(payload, "tags", []) or [],
+        status="draft",
+        created_by=actor_id,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(wf)
+    await session.flush()
+
+    ver_id = str(uuid.uuid4())
+    initial_graph = {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}}
+    ver = WorkflowVersion(
+        id=ver_id,
+        workflow_id=wf_id,
+        version_number=1,
+        graph_json=initial_graph,
+        change_note="Initial draft",
+        is_valid=False,
+        created_by=actor_id,
+        created_at=datetime.utcnow(),
+    )
+    session.add(ver)
+    wf.draft_version_id = ver_id
+    await session.commit()
+    return wf
+
+
+async def get_workflow(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    workflow_id: str,
+) -> Any:
+    """Fetch workflow metadata & version details."""
+    _, wf = await _get_workflow_with_lock(session, hub_id, workflow_id, for_update=False)
+    return wf
+
+
+async def update_workflow(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    workflow_id: str,
+    payload: Any,
+) -> WorkflowDefinition:
+    """Update workflow metadata (name, description, tags, slug)."""
+    hub, wf = await _get_workflow_with_lock(session, hub_id, workflow_id, for_update=True)
+    if hub.is_archived:
+        raise HubArchivedError(f"Cannot update workflow: Hub '{hub_id}' is archived.")
+
+    if getattr(payload, "slug", None) and payload.slug != wf.slug:
+        stmt_chk = select(WorkflowDefinition).where(
+            WorkflowDefinition.hub_id == hub_id,
+            WorkflowDefinition.slug == payload.slug,
+        )
+        if (await session.execute(stmt_chk)).scalar_one_or_none():
+            raise ValueError(f"WORKFLOW_SLUG_TAKEN: Workflow with slug '{payload.slug}' already exists in hub.")
+        wf.slug = payload.slug
+
+    if getattr(payload, "name", None) is not None:
+        wf.name = payload.name
+    if getattr(payload, "description", None) is not None:
+        wf.description = payload.description
+    if getattr(payload, "tags", None) is not None:
+        wf.tags_json = payload.tags
+
+    wf.updated_at = datetime.utcnow()
+    await session.commit()
+    return wf
+
+
+async def delete_workflow(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    workflow_id: str,
+) -> None:
+    """Delete a workflow definition and all associated versions & runs."""
+    hub, wf = await _get_workflow_with_lock(session, hub_id, workflow_id, for_update=True)
+    if hub.is_archived:
+        raise HubArchivedError(f"Cannot delete workflow: Hub '{hub_id}' is archived.")
+
+    await session.delete(wf)
+    await session.commit()
+
+
+async def get_version(
+    session: AsyncSession,
+    *,
+    hub_id: str,
+    workflow_id: str,
+    version_number: int,
+) -> WorkflowVersion:
+    """Fetch specific WorkflowVersion by version_number."""
+    await _get_workflow_with_lock(session, hub_id, workflow_id, for_update=False)
+    stmt = select(WorkflowVersion).where(
+        WorkflowVersion.workflow_id == workflow_id,
+        WorkflowVersion.version_number == version_number,
+    )
+    ver = (await session.execute(stmt)).scalar_one_or_none()
+    if not ver:
+        raise VersionNotFoundError(f"Version '{version_number}' not found for workflow '{workflow_id}'.")
+    return ver

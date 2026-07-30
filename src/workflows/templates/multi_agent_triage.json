@@ -1,0 +1,72 @@
+{
+  "format": "contained.workflow/v6",
+  "exported_at": "2026-07-30T00:00:00Z",
+  "source": {
+    "hub_id": "default-hub",
+    "hub_slug": "default-hub",
+    "hub_type": "workflow"
+  },
+  "workflow": {
+    "name": "Multi-Agent Triage",
+    "slug": "multi-agent-triage",
+    "description": "Triage queries across specialized agents",
+    "tags": ["triage", "multi-agent"]
+  },
+  "version": {
+    "version_number": 1,
+    "change_note": "Initial template",
+    "graph": {
+      "nodes": [
+        {
+          "id": "n1",
+          "type": "ClassifierNode",
+          "data": { "label": "Classify Query" }
+        },
+        {
+          "id": "n2",
+          "type": "RouterNode",
+          "data": { "label": "Route Query" }
+        },
+        {
+          "id": "n3",
+          "type": "MultiAgentNode",
+          "data": {
+            "label": "Swarm Triage",
+            "reference": {
+              "type": "agent",
+              "hub_id": "default-hub",
+              "resource_id": "agt_triage"
+            }
+          }
+        },
+        {
+          "id": "n4",
+          "type": "GatherNode",
+          "data": { "label": "Gather Results" }
+        },
+        {
+          "id": "n5",
+          "type": "FinalMessageNode",
+          "data": { "label": "Output" }
+        }
+      ],
+      "edges": [
+        { "source": "n1", "target": "n2" },
+        { "source": "n2", "target": "n3" },
+        { "source": "n3", "target": "n4" },
+        { "source": "n4", "target": "n5" }
+      ],
+      "viewport": {}
+    }
+  },
+  "dependencies": [
+    {
+      "ref_key": "agent:agt_triage",
+      "type": "agent",
+      "source_hub_id": "default-hub",
+      "resource_id": "agt_triage",
+      "resource_slug": "triage-agent",
+      "node_ids": ["n3"]
+    }
+  ]
+}

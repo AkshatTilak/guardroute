@@ -1,0 +1,77 @@
+{
+  "format": "contained.workflow/v6",
+  "exported_at": "2026-07-30T00:00:00Z",
+  "source": {
+    "hub_id": "default-hub",
+    "hub_slug": "default-hub",
+    "hub_type": "workflow"
+  },
+  "workflow": {
+    "name": "RAG QA Workflow",
+    "slug": "rag-qa-workflow",
+    "description": "Retrieval Augmented Generation QA pipeline",
+    "tags": ["rag", "qa"]
+  },
+  "version": {
+    "version_number": 1,
+    "change_note": "Initial template",
+    "graph": {
+      "nodes": [
+        {
+          "id": "n1",
+          "type": "RetrievalNode",
+          "data": {
+            "label": "Search Knowledge",
+            "reference": {
+              "type": "collection",
+              "hub_id": "default-hub",
+              "resource_id": "col_knowledge"
+            }
+          }
+        },
+        {
+          "id": "n2",
+          "type": "AgentNode",
+          "data": {
+            "label": "RAG Agent",
+            "reference": {
+              "type": "agent",
+              "hub_id": "default-hub",
+              "resource_id": "agt_rag"
+            }
+          }
+        },
+        {
+          "id": "n3",
+          "type": "FinalMessageNode",
+          "data": {
+            "label": "Output"
+          }
+        }
+      ],
+      "edges": [
+        { "source": "n1", "target": "n2" },
+        { "source": "n2", "target": "n3" }
+      ],
+      "viewport": {}
+    }
+  },
+  "dependencies": [
+    {
+      "ref_key": "collection:col_knowledge",
+      "type": "collection",
+      "source_hub_id": "default-hub",
+      "resource_id": "col_knowledge",
+      "resource_slug": "kb-collection",
+      "node_ids": ["n1"]
+    },
+    {
+      "ref_key": "agent:agt_rag",
+      "type": "agent",
+      "source_hub_id": "default-hub",
+      "resource_id": "agt_rag",
+      "resource_slug": "rag-agent",
+      "node_ids": ["n2"]
+    }
+  ]
+}
