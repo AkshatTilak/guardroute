@@ -16,7 +16,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.database import Hub, WorkflowDefinition, WorkflowVersion
-from projects.guardroute.src.core.graph_parser import GraphParser, GraphValidationError
+from projects.guardroute.src.core.graph_parser import GraphParser, GraphValidationError, validate_workflow_graph
 
 
 class WorkflowNotFoundError(Exception):
@@ -177,12 +177,21 @@ async def _get_workflow_with_lock(
     return hub, wf
 
 
-def _validate_graph_payload(graph: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
-    """Run GraphParser on graph payload and return (is_valid, validation_json)."""
-    parser = GraphParser(graph)
+async def _validate_graph_payload(
+    session: Optional[AsyncSession],
+    source_hub_id: str,
+    graph: Dict[str, Any],
+    strict: bool = False,
+) -> tuple[bool, Dict[str, Any]]:
+    """Run validate_workflow_graph on graph payload and return (is_valid, validation_json dict)."""
     try:
-        parser.validate_graph(graph)
-        return True, {"is_valid": True, "errors": [], "warnings": []}
+        val_res = await validate_workflow_graph(
+            session=session,  # type: ignore
+            graph_json=graph,
+            source_hub_id=source_hub_id,
+            strict=strict,
+        )
+        return val_res.is_valid, val_res.model_dump()
     except GraphValidationError as e:
         return False, {"is_valid": False, "errors": [{"message": str(e)}], "warnings": []}
     except Exception as e:
@@ -220,7 +229,7 @@ async def get_draft(session: AsyncSession, *, hub_id: str, workflow_id: str) -> 
         if pub_ver and pub_ver.graph_json:
             source_graph = pub_ver.graph_json
 
-    is_valid, val_json = _validate_graph_payload(source_graph)
+    is_valid, val_json = await _validate_graph_payload(session, hub_id, source_graph, strict=False)
 
     new_draft = WorkflowVersion(
         id=str(uuid.uuid4()),
@@ -273,7 +282,7 @@ async def update_draft(
             updated_at=draft.created_at.isoformat() if draft.created_at else None,
         )
 
-    is_valid, val_json = _validate_graph_payload(graph)
+    is_valid, val_json = await _validate_graph_payload(session, hub_id, graph, strict=False)
 
     draft.graph_json = graph
     draft.is_valid = is_valid
@@ -309,8 +318,8 @@ async def publish(
 
     draft = await get_draft(session, hub_id=hub_id, workflow_id=workflow_id)
 
-    # Validate graph topology before publishing
-    is_valid, val_json = _validate_graph_payload(draft.graph_json)
+    # Validate graph topology & references before publishing
+    is_valid, val_json = await _validate_graph_payload(session, hub_id, draft.graph_json, strict=True)
     if not is_valid:
         errors_desc = "; ".join([e.get("message", "Validation error") for e in val_json.get("errors", [])])
         raise GraphValidationError(f"Cannot publish invalid workflow graph: {errors_desc}")
@@ -358,7 +367,7 @@ async def restore(
     max_ver = (await session.execute(stmt_max)).scalar() or 0
     next_ver = max_ver + 1
 
-    is_valid, val_json = _validate_graph_payload(target_ver.graph_json)
+    is_valid, val_json = await _validate_graph_payload(session, hub_id, target_ver.graph_json, strict=False)
 
     new_draft = WorkflowVersion(
         id=str(uuid.uuid4()),
@@ -437,7 +446,7 @@ async def duplicate(
     session.add(new_wf)
     await session.flush()
 
-    is_valid, val_json = _validate_graph_payload(graph_to_copy)
+    is_valid, val_json = await _validate_graph_payload(session, dest_hub_id, graph_to_copy, strict=False)
     new_v1 = WorkflowVersion(
         id=str(uuid.uuid4()),
         workflow_id=new_wf_id,

@@ -55,7 +55,64 @@ from projects.guardroute.src.nodes.multi_agent_executor import execute_multi_age
 from projects.guardroute.src.nodes.action_executor import execute_action_node
 from projects.guardroute.src.nodes.final_message_executor import execute_final_message_node
 
+from sqlalchemy.ext.asyncio import AsyncSession
+from common.schemas.workflows import NodeReference, ValidationIssue, ValidationResult
+from common.services.hub_resolver import resolve_linked, HubLinkError
+from common.services.hub_repository import get_hub
+
 logger = logging.getLogger("guardroute.core.graph_parser")
+
+NODE_REFERENCE_REQUIREMENTS: Dict[str, str] = {
+    "AgentNode": "agent",
+    "agent": "agent",
+    "MultiAgentNode": "agent",  # list-valued in data["references"]
+    "RetrievalNode": "collection",
+    "retrieval": "collection",
+    "MCPToolNode": "mcp_tool",
+    "mcp_tool": "mcp_tool",
+}
+
+
+def collect_references(graph_json: Dict[str, Any]) -> List[tuple[str, NodeReference]]:
+    """Extract (node_id, NodeReference) pairs from graph JSON."""
+    refs: List[tuple[str, NodeReference]] = []
+    nodes = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
+    for node in nodes:
+        nid = node.get("id")
+        if not nid:
+            continue
+        data_cfg = node.get("data", {})
+        if "references" in data_cfg and isinstance(data_cfg["references"], list):
+            for ref_item in data_cfg["references"]:
+                try:
+                    nr = NodeReference.model_validate(ref_item)
+                    refs.append((nid, nr))
+                except Exception:
+                    pass
+        elif "reference" in data_cfg and data_cfg["reference"]:
+            try:
+                nr = NodeReference.model_validate(data_cfg["reference"])
+                refs.append((nid, nr))
+            except Exception:
+                pass
+        else:
+            ntype = node.get("type")
+            req_type = NODE_REFERENCE_REQUIREMENTS.get(ntype)
+            if req_type:
+                alias_val = (
+                    data_cfg.get(f"{req_type}_id")
+                    or data_cfg.get("agent_id")
+                    or data_cfg.get("collection_id")
+                    or data_cfg.get("mcp_tool_id")
+                )
+                hub_id = data_cfg.get("hub_id")
+                if alias_val and hub_id:
+                    try:
+                        nr = NodeReference(type=req_type, hub_id=hub_id, resource_id=alias_val)
+                        refs.append((nid, nr))
+                    except Exception:
+                        pass
+    return refs
 
 
 class GraphValidationError(Exception):
@@ -317,8 +374,380 @@ class GraphParser:
 
         return workflow.compile()
 
+    async def validate_references(
+        self,
+        graph_json: Optional[Dict[str, Any]] = None,
+        *,
+        session: AsyncSession,
+        source_hub_id: str,
+    ) -> List[ValidationIssue]:
+        """Validate qualified node references against database session and source hub link policies."""
+        data = graph_json or self.graph_json
+        nodes = data.get("nodes", []) if isinstance(data, dict) else []
+        issues: List[ValidationIssue] = []
+
+        for node in nodes:
+            nid = node.get("id")
+            ntype = node.get("type", "")
+            data_cfg = node.get("data", {})
+            req_type = NODE_REFERENCE_REQUIREMENTS.get(ntype)
+            if not req_type:
+                continue
+
+            if ntype in {"MultiAgentNode", "multi_agent"}:
+                refs_list = data_cfg.get("references")
+                if not refs_list or not isinstance(refs_list, list):
+                    issues.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="MISSING_REFERENCE",
+                            level="error",
+                            message=f"Node '{nid}' of type '{ntype}' is missing required 'data.references' list.",
+                            field="data.references",
+                        )
+                    )
+                    continue
+
+                for idx, ref_item in enumerate(refs_list):
+                    try:
+                        nr = NodeReference.model_validate(ref_item)
+                    except Exception as err:
+                        issues.append(
+                            ValidationIssue(
+                                node_id=nid,
+                                node_type=ntype,
+                                code="MALFORMED_REFERENCE",
+                                level="error",
+                                message=f"Node '{nid}' reference at index {idx} is malformed: {str(err)}",
+                                field=f"data.references[{idx}]",
+                                reference=ref_item if isinstance(ref_item, dict) else None,
+                            )
+                        )
+                        continue
+
+                    if nr.type != req_type:
+                        issues.append(
+                            ValidationIssue(
+                                node_id=nid,
+                                node_type=ntype,
+                                code="REFERENCE_TYPE_MISMATCH",
+                                level="error",
+                                message=f"Node '{nid}' requires reference type '{req_type}' but got '{nr.type}'.",
+                                field=f"data.references[{idx}].type",
+                                reference=nr.model_dump(),
+                            )
+                        )
+                        continue
+
+                    await self._check_single_reference(
+                        session=session,
+                        source_hub_id=source_hub_id,
+                        nid=nid,
+                        ntype=ntype,
+                        field=f"data.references[{idx}]",
+                        nr=nr,
+                        issues=issues,
+                    )
+            else:
+                raw_ref = data_cfg.get("reference")
+                if not raw_ref:
+                    alias_val = (
+                        data_cfg.get(f"{req_type}_id")
+                        or data_cfg.get("agent_id")
+                        or data_cfg.get("collection_id")
+                        or data_cfg.get("mcp_tool_id")
+                    )
+                    hub_id = data_cfg.get("hub_id")
+                    if alias_val and hub_id:
+                        raw_ref = {"type": req_type, "hub_id": hub_id, "resource_id": alias_val}
+                    else:
+                        issues.append(
+                            ValidationIssue(
+                                node_id=nid,
+                                node_type=ntype,
+                                code="MISSING_REFERENCE",
+                                level="error",
+                                message=f"Node '{nid}' of type '{ntype}' is missing required 'data.reference'.",
+                                field="data.reference",
+                            )
+                        )
+                        continue
+
+                try:
+                    nr = NodeReference.model_validate(raw_ref)
+                except Exception as err:
+                    issues.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="MALFORMED_REFERENCE",
+                            level="error",
+                            message=f"Node '{nid}' reference is malformed: {str(err)}",
+                            field="data.reference",
+                            reference=raw_ref if isinstance(raw_ref, dict) else None,
+                        )
+                    )
+                    continue
+
+                if nr.type != req_type:
+                    issues.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="REFERENCE_TYPE_MISMATCH",
+                            level="error",
+                            message=f"Node '{nid}' requires reference type '{req_type}' but got '{nr.type}'.",
+                            field="data.reference.type",
+                            reference=nr.model_dump(),
+                        )
+                    )
+                    continue
+
+                await self._check_single_reference(
+                    session=session,
+                    source_hub_id=source_hub_id,
+                    nid=nid,
+                    ntype=ntype,
+                    field="data.reference",
+                    nr=nr,
+                    issues=issues,
+                )
+
+        return issues
+
+    async def _check_single_reference(
+        self,
+        session: AsyncSession,
+        source_hub_id: str,
+        nid: str,
+        ntype: str,
+        field: str,
+        nr: NodeReference,
+        issues: List[ValidationIssue],
+    ) -> None:
+        target_hub = await get_hub(session, nr.hub_id)
+        if not target_hub:
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code="REFERENCE_TARGET_MISSING",
+                    level="error",
+                    message=f"Target hub '{nr.hub_id}' for node '{nid}' was not found.",
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+            return
+
+        if target_hub.is_archived:
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code="HUB_ARCHIVED",
+                    level="error",
+                    message=f"Target hub '{nr.hub_id}' for node '{nid}' is archived.",
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+            return
+
+        if nr.type == "mcp_tool":
+            if source_hub_id != nr.hub_id:
+                try:
+                    await resolve_linked(
+                        session,
+                        source_hub_id=source_hub_id,
+                        target_resource_type="agent",  # check hub direction
+                        target_resource_id=nr.resource_id,
+                    )
+                except HubLinkError as err:
+                    code = "HUB_LINK_REQUIRED" if err.code == "HUB_LINK_REQUIRED" else "HUB_LINK_REVOKED"
+                    issues.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code=code,
+                            level="error",
+                            message=f"Workflow hub '{source_hub_id}' is not linked to hub '{nr.hub_id}'.",
+                            field=field,
+                            reference=nr.model_dump(),
+                        )
+                    )
+            return
+
+        try:
+            res_obj = await resolve_linked(
+                session,
+                source_hub_id=source_hub_id,
+                target_resource_type=nr.type,
+                target_resource_id=nr.resource_id,
+            )
+        except HubLinkError as err:
+            code = "HUB_LINK_REQUIRED"
+            if err.code == "HUB_LINK_REVOKED":
+                code = "HUB_LINK_REVOKED"
+            msg = f"Workflow hub '{source_hub_id}' is not linked to target hub '{nr.hub_id}'."
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code=code,
+                    level="error",
+                    message=msg,
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+            return
+        except Exception as err:
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code="REFERENCE_TARGET_MISSING",
+                    level="error",
+                    message=f"Referenced resource '{nr.resource_id}' for node '{nid}' was not found: {str(err)}",
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+            return
+
+        res_hub_id = getattr(res_obj, "hub_id", None)
+        if res_hub_id and res_hub_id != nr.hub_id:
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code="CROSS_HUB_REFERENCE_MISMATCH",
+                    level="error",
+                    message=f"Reference hub_id '{nr.hub_id}' does not match resolved resource's hub_id '{res_hub_id}'.",
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+            return
+
+        res_status = getattr(res_obj, "status", None)
+        res_is_active = getattr(res_obj, "is_active", True)
+        if res_status == "archived" or res_is_active is False:
+            issues.append(
+                ValidationIssue(
+                    node_id=nid,
+                    node_type=ntype,
+                    code="REFERENCE_INACTIVE",
+                    level="error",
+                    message=f"Referenced {nr.type} '{nr.resource_id}' for node '{nid}' is inactive or archived.",
+                    field=field,
+                    reference=nr.model_dump(),
+                )
+            )
+
 
 def parse_graph_json_to_langgraph(graph_json: Dict[str, Any]) -> Any:
     """Convenience function to parse JSON graph and compile a LangGraph StateGraph."""
     parser = GraphParser(graph_json)
     return parser.build_langgraph()
+
+
+async def validate_workflow_graph(
+    session: AsyncSession,
+    *,
+    graph_json: Dict[str, Any],
+    source_hub_id: str,
+    strict: bool = False,
+) -> ValidationResult:
+    """Single validation entry point for workflow graph topology and qualified references."""
+    parser = GraphParser(graph_json)
+    errors: List[ValidationIssue] = []
+    warnings: List[ValidationIssue] = []
+
+    nodes = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
+    edges = graph_json.get("edges", []) if isinstance(graph_json, dict) else []
+
+    if not nodes:
+        errors.append(
+            ValidationIssue(
+                code="EMPTY_GRAPH",
+                level="error",
+                message="Workflow graph must contain at least one node.",
+            )
+        )
+    else:
+        node_map = {node["id"]: node for node in nodes if "id" in node}
+        node_ids = set(node_map.keys())
+
+        adj: Dict[str, List[str]] = {nid: [] for nid in node_ids}
+        in_degree: Dict[str, int] = {nid: 0 for nid in node_ids}
+
+        for edge in edges:
+            src = edge.get("source")
+            tgt = edge.get("target")
+            if src not in node_ids or tgt not in node_ids:
+                errors.append(
+                    ValidationIssue(
+                        code="DANGLING_EDGE",
+                        level="error",
+                        message=f"Edge references invalid node ID: source={src}, target={tgt}",
+                    )
+                )
+            else:
+                adj[src].append(tgt)
+                in_degree[tgt] += 1
+
+        queue = [nid for nid in node_ids if in_degree[nid] == 0]
+        visited_count = 0
+        in_degree_copy = dict(in_degree)
+
+        while queue:
+            curr = queue.pop(0)
+            visited_count += 1
+            for neighbor in adj[curr]:
+                in_degree_copy[neighbor] -= 1
+                if in_degree_copy[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if visited_count < len(node_ids):
+            errors.append(
+                ValidationIssue(
+                    code="CYCLE_DETECTED",
+                    level="error",
+                    message="Workflow graph contains an infinite cycle. Workflows must be acyclic.",
+                )
+            )
+
+        all_sources = {e.get("source") for e in edges}
+        leaf_ids = [nid for nid in node_ids if nid not in all_sources]
+        for leaf_id in leaf_ids:
+            leaf_node = node_map[leaf_id]
+            ntype = leaf_node.get("type", "AgentNode")
+            if ntype not in GraphParser.TERMINAL_NODE_TYPES:
+                errors.append(
+                    ValidationIssue(
+                        node_id=leaf_id,
+                        node_type=ntype,
+                        code="NON_TERMINAL_LEAF",
+                        level="error",
+                        message=(
+                            f"Rule 8 Violation: Path terminates at non-terminal node '{leaf_id}' of type '{ntype}'. "
+                            "Every workflow path MUST conclude in an ActionNode, FinalMessageNode, or SynthesisNode."
+                        ),
+                    )
+                )
+
+    if source_hub_id and session is not None:
+        ref_issues = await parser.validate_references(graph_json, session=session, source_hub_id=source_hub_id)
+        errors.extend(ref_issues)
+
+    is_valid = len(errors) == 0
+    res = ValidationResult(is_valid=is_valid, errors=errors, warnings=warnings)
+
+    if strict and not is_valid:
+        err_msgs = "; ".join([e.message for e in errors])
+        raise GraphValidationError(f"Workflow graph validation failed: {err_msgs}")
+
+    return res
