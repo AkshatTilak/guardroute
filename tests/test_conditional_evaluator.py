@@ -1,6 +1,5 @@
 """Unit tests for GuardRoute conditional_evaluator."""
 
-import pytest
 from projects.guardroute.src.nodes.conditional_evaluator import (
     evaluate_condition,
     _safe_eval_ast,

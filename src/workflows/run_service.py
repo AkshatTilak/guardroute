@@ -8,15 +8,13 @@ import uuid
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Literal
 
-from sqlalchemy import select, func, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.database import (
-    Hub,
     WorkflowDefinition,
     WorkflowVersion,
     WorkflowRun,
-    EvalFlowTrace,
 )
 from common.schemas.workflows import (
     WorkflowRunSummary,
@@ -27,8 +25,6 @@ from common.clients.postgres import get_sessionmaker
 from projects.evalops.src.runner.trace_collector import TraceCollector
 from projects.guardroute.src.core.graph_parser import (
     GraphParser,
-    GraphValidationError,
-    validate_workflow_graph,
 )
 
 logger = logging.getLogger("guardroute.workflows.run_service")

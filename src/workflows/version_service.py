@@ -16,7 +16,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.database import Hub, WorkflowDefinition, WorkflowVersion
-from projects.guardroute.src.core.graph_parser import GraphParser, GraphValidationError, validate_workflow_graph
+from projects.guardroute.src.core.graph_parser import GraphValidationError, validate_workflow_graph
 
 
 class WorkflowNotFoundError(Exception):

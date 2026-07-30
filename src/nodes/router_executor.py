@@ -4,7 +4,7 @@ Evaluates an array of route rules against state and selects the first matching b
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from projects.guardroute.src.nodes.conditional_evaluator import evaluate_condition
 
 logger = logging.getLogger("guardroute.nodes.router_executor")

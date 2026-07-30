@@ -10,7 +10,6 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient, ASGITransport
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from projects.syntraflow.api import sanitize_filename
 from common.config.settings import settings
@@ -145,7 +144,6 @@ async def test_verify_api_key_valid():
 async def test_request_size_limit_blocks_large_json():
     """Requests exceeding MAX_JSON_SIZE are rejected with 413."""
     from gateway.main import RequestSizeLimitMiddleware
-    from fastapi import FastAPI
 
     small_app = FastAPI()
 

@@ -7,7 +7,7 @@ and exponential backoff retry handling.
 import asyncio
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import httpx
 
 from projects.guardroute.src.nodes.ssrf_protection import validate_url_for_ssrf, SSRFValidationError

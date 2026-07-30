@@ -1,6 +1,5 @@
 """Unit tests for GuardRoute router_executor."""
 
-import pytest
 from projects.guardroute.src.nodes.router_executor import evaluate_routes
 
 

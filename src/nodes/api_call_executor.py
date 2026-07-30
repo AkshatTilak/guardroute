@@ -4,9 +4,8 @@ Supports REST API calls (GET, POST, PUT, PATCH, DELETE) with auth options (Beare
 SSRF protection, and JSONPath output mapping.
 """
 
-import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import httpx
 
 from projects.guardroute.src.nodes.ssrf_protection import validate_url_for_ssrf, SSRFValidationError

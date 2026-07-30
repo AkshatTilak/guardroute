@@ -7,10 +7,8 @@ Handles data transformations:
 - Formatting and restructuring JSON data
 """
 
-import json
 import logging
-from typing import Any, Dict, Optional
-import jinja2
+from typing import Any, Dict
 from jinja2.sandbox import SandboxedEnvironment
 
 from projects.guardroute.src.nodes.conditional_evaluator import _get_nested_val

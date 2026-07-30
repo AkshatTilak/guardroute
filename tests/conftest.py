@@ -1,5 +1,4 @@
 import os
-import pytest
 from common.config import settings
 
 # Inject mock environment variables required for initialization before importing app code

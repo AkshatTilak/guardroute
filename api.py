@@ -6,7 +6,7 @@ Supports token-by-token response streaming via Server-Sent Events (SSE).
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse

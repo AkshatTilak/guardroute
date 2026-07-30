@@ -11,10 +11,8 @@ Supports:
 import time
 import json
 import logging
-import asyncio
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
-from common.config.settings import settings
 from common.clients.inference import InferenceClient
 from common.clients.litellm import completion_with_fallback
 from common.models.registry import get_active_model

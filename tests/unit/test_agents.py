@@ -4,7 +4,7 @@
 import pytest
 import json
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from common.schemas.agent_types import SubAgentStatus
 from projects.guardroute.src.agents.coding import run_code_sandbox

@@ -5,7 +5,7 @@ Dispatches side-effects (HTTP payload post or DB mutation) as terminal workflow 
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 from projects.guardroute.src.nodes.ssrf_protection import validate_url_for_ssrf, SSRFValidationError

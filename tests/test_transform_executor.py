@@ -1,6 +1,5 @@
 """Unit tests for GuardRoute transform_executor."""
 
-import pytest
 from projects.guardroute.src.nodes.transform_executor import execute_transform
 
 

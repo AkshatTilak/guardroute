@@ -5,7 +5,7 @@ and compares aggregate score against a threshold to return a Pass/Fail branch de
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("guardroute.nodes.eval_executor")
 

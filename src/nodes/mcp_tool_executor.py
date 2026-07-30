@@ -4,7 +4,7 @@ Invokes registered MCP server tools using state parameter mapping.
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from projects.guardroute.src.nodes.webhook_executor import _interpolate_dict
 
 logger = logging.getLogger("guardroute.nodes.mcp_tool_executor")

@@ -6,7 +6,7 @@ Evaluates branching conditions safely against GraphState without executing arbit
 import ast
 import re
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("guardroute.nodes.conditional_evaluator")
 

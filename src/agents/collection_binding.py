@@ -6,18 +6,15 @@ Enforces cross-hub link grants (HUB_LINK_REQUIRED at save, HUB_LINK_REVOKED at i
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.models.database import Hub, HubLink
+from common.models.database import Hub
 from common.schemas.agent_types import CollectionBinding, CollectionBindingResponse
 from common.services.hub_repository import get_link
-from projects.syntraflow.src.collections.manager import CollectionManager
 from projects.syntraflow.src.database.models import SyntraFlowCollection
-from projects.syntraflow.src.datastores.resolver import resolve_vector_client
 
 logger = logging.getLogger("guardroute.agents.collection_binding")
 

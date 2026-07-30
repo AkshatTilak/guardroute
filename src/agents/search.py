@@ -5,7 +5,7 @@ Queries DuckDuckGo search engine to collect live context from the web.
 
 import asyncio
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict
 try:
     from duckduckgo_search import DDGS
     HAS_DDGS = True

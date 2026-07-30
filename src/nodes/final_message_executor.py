@@ -5,7 +5,6 @@ the final synthesized response returned to the user.
 """
 
 import logging
-import time
 from typing import Any, Dict
 
 from common.clients.litellm import completion_with_fallback

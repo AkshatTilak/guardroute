@@ -7,7 +7,7 @@ passing context and appending structured SubAgentResult objects to GraphState.
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from common.clients.litellm import completion_with_fallback
 from common.schemas.agent_types import SubAgentResult, SubAgentStatus

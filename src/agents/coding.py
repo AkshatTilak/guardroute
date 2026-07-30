@@ -5,13 +5,11 @@ Enforces limits on network, files, processes, imports, memory, and timeout.
 """
 
 import sys
-import io
 import math
 import json
 import threading
 import queue
 import time
-from typing import Any, Dict
 try:
     from RestrictedPython import compile_restricted, safe_builtins
     from RestrictedPython.PrintCollector import PrintCollector
