@@ -71,19 +71,23 @@ def get_redis_connection() -> Optional[Any]:
 def publish_trace_to_kafka(trace_data: Dict[str, Any]) -> None:
     """Publish the execution trace data asynchronously to a Kafka topic."""
     try:
-        from confluent_kafka import Producer
-        conf = {"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS}
-        producer = Producer(conf)
-        
-        producer.produce(
-            "guardroute-traces",
-            key=str(trace_data.get("session_id", time.time())),
-            value=json.dumps(trace_data)
-        )
-        producer.flush()
-        logger.info("Trace event successfully published to Kafka: guardroute-traces")
+        import socket
+        host, port = settings.KAFKA_BOOTSTRAP_SERVERS.split(":")[0], int(settings.KAFKA_BOOTSTRAP_SERVERS.split(":")[1]) if ":" in settings.KAFKA_BOOTSTRAP_SERVERS else 9092
+        with socket.create_connection((host, port), timeout=0.2):
+            from confluent_kafka import Producer
+            conf = {"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS}
+            producer = Producer(conf)
+            
+            producer.produce(
+                "guardroute-traces",
+                key=str(trace_data.get("session_id", time.time())),
+                value=json.dumps(trace_data)
+            )
+            producer.flush()
+            logger.info("Trace event successfully published to Kafka: guardroute-traces")
+            return
     except Exception as e:
-        logger.warning("Kafka broker unavailable: %s. Trace logged locally.", e)
+        logger.debug("Kafka broker unavailable: %s. Fallback to local trace log.", e)
         try:
             import os
             os.makedirs("logs", exist_ok=True)
