@@ -1,4 +1,12 @@
-"""Run Orchestration, Persistence & SSE Streaming for Workflow Hub (S6-06d)."""
+"""Run Orchestration, Persistence & SSE Streaming for Workflow Hub (S6-06d).
+
+Execution flow:
+1. start_run()   — creates WorkflowRun row, launches _execute_run_task() in background.
+2. _execute_run_task() — compiles graph via GraphParser.build_langgraph(), seeds
+   GraphState from input_json, calls compiled_graph.ainvoke(), then persists one
+   WorkflowRunStep row per node with input/output state, latency, and status.
+3. stream_run()  — async generator yielding SSE events to callers.
+"""
 
 import asyncio
 import json
@@ -8,17 +16,19 @@ import uuid
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Literal
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.models.database import (
     WorkflowDefinition,
     WorkflowVersion,
     WorkflowRun,
+    WorkflowRunStep,
 )
 from common.schemas.workflows import (
     WorkflowRunSummary,
     WorkflowRunDetail,
+    WorkflowRunStepSummary,
 )
 from common.services.hub_repository import get_hub
 from common.clients.postgres import get_sessionmaker
@@ -213,6 +223,127 @@ async def start_run(
     return run
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _seed_graph_state(input_json: Dict[str, Any]) -> Dict[str, Any]:
+    """Map input_json into the GraphState seed dict.
+
+    The top-level 'input' key (or 'prompt') is mapped to 'prompt';
+    everything else is passed through as additional state keys.
+    """
+    state: Dict[str, Any] = {}
+    state["prompt"] = (
+        input_json.get("input")
+        or input_json.get("prompt")
+        or ""
+    )
+    state["subagent_results"] = []
+    state["final_response"] = None
+    state["webhook_results"] = {}
+    state["api_call_results"] = {}
+    state["eval_results"] = {}
+    state["transform_outputs"] = {}
+    state["mcp_tool_results"] = {}
+    state["conditional_flags"] = {}
+    state["errors"] = {}
+    state["db_query_results"] = {}
+    state["db_store_results"] = {}
+    # Pass through any extra user-supplied keys
+    for k, v in input_json.items():
+        if k not in ("input", "prompt"):
+            state[k] = v
+    return state
+
+
+def _build_topo_order(nodes: List[Dict], edges: List[Dict]) -> List[str]:
+    """Return a Kahn's-algorithm topological order of node IDs.
+
+    Falls back to the node insertion order if the graph has cycles
+    (validation should have already caught that, but we defend here).
+    """
+    node_ids = [n["id"] for n in nodes if "id" in n]
+    adj: Dict[str, List[str]] = {nid: [] for nid in node_ids}
+    in_degree: Dict[str, int] = {nid: 0 for nid in node_ids}
+    for e in edges:
+        src, tgt = e.get("source"), e.get("target")
+        if src in adj and tgt in adj:
+            adj[src].append(tgt)
+            in_degree[tgt] += 1
+
+    queue = [nid for nid in node_ids if in_degree[nid] == 0]
+    order: List[str] = []
+    in_degree_copy = dict(in_degree)
+    while queue:
+        curr = queue.pop(0)
+        order.append(curr)
+        for nxt in adj[curr]:
+            in_degree_copy[nxt] -= 1
+            if in_degree_copy[nxt] == 0:
+                queue.append(nxt)
+    # If cycle prevented full traversal fall back to full node list
+    if len(order) < len(node_ids):
+        remaining = [nid for nid in node_ids if nid not in set(order)]
+        order.extend(remaining)
+    return order
+
+
+def _has_error_edge(node_id: str, edges: List[Dict]) -> bool:
+    """Return True if node_id has an outgoing edge from the 'error' handle."""
+    for e in edges:
+        if e.get("source") == node_id and e.get("sourceHandle") == "error":
+            return True
+    return False
+
+
+async def _persist_run_step(
+    session_factory: Any,
+    *,
+    hub_id: str,
+    run_id: str,
+    workflow_id: str,
+    node_id: str,
+    node_type: str,
+    sequence: int,
+    status: str,
+    input_state: Dict[str, Any],
+    output_state: Dict[str, Any],
+    error_json: Optional[Dict[str, Any]],
+    started_at: datetime,
+    finished_at: datetime,
+    latency_ms: float,
+) -> None:
+    """Persist a single WorkflowRunStep row."""
+    try:
+        async with session_factory() as session:
+            step = WorkflowRunStep(
+                id=str(uuid.uuid4()),
+                hub_id=hub_id,
+                run_id=run_id,
+                workflow_id=workflow_id,
+                node_id=node_id,
+                node_type=node_type,
+                sequence=sequence,
+                status=status,
+                input_state=input_state,
+                output_state=output_state,
+                error_json=error_json,
+                started_at=started_at,
+                finished_at=finished_at,
+                latency_ms=latency_ms,
+            )
+            session.add(step)
+            await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "Failed to persist WorkflowRunStep node=%s run=%s: %s",
+            node_id,
+            run_id,
+            exc,
+        )
+
+
 async def _execute_run_task(
     *,
     run_id: str,
@@ -225,11 +356,12 @@ async def _execute_run_task(
     timeout_s: int,
     session_factory: Any,
 ) -> None:
-    """Background task executing the graph step-by-step with state persistence, trace emission, & SSE."""
+    """Background task: compile and execute the real LangGraph, persist step telemetry, emit SSE."""
     start_time = datetime.utcnow()
-    nodes = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
-    edges = graph_json.get("edges", []) if isinstance(graph_json, dict) else []
-    node_map = {n["id"]: n for n in nodes if "id" in n}
+    nodes: List[Dict] = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
+    edges: List[Dict] = graph_json.get("edges", []) if isinstance(graph_json, dict) else []
+    node_map: Dict[str, Dict] = {n["id"]: n for n in nodes if "id" in n}
+    topo_order: List[str] = _build_topo_order(nodes, edges)
 
     _publish_event(
         run_id,
@@ -251,109 +383,182 @@ async def _execute_run_task(
     run_status = "succeeded"
     error_info: Optional[Dict[str, Any]] = None
     output_data: Dict[str, Any] = {}
-    seq = 0
+    final_state: Dict[str, Any] = {}
 
     try:
+        # ------------------------------------------------------------------
+        # Build the compiled LangGraph from the visual graph JSON
+        # ------------------------------------------------------------------
+        parser = GraphParser(graph_json)
+        compiled_graph = parser.build_langgraph()
+
+        initial_state = _seed_graph_state(input_json)
+        initial_state["hub_id"] = hub_id
+
         async def _run_inner():
-            nonlocal seq, run_status, error_info, output_data
-            current_state = dict(input_json)
+            nonlocal run_status, error_info, output_data, final_state
 
-            adj: Dict[str, List[str]] = {nid: [] for nid in node_map}
-            in_degree: Dict[str, int] = {nid: 0 for nid in node_map}
-            for e in edges:
-                src, tgt = e.get("source"), e.get("target")
-                if src in node_map and tgt in node_map:
-                    adj[src].append(tgt)
-                    in_degree[tgt] += 1
+            # Validate cross-hub references at run start
+            async with session_factory() as session:
+                ref_issues = await parser.validate_references(
+                    graph_json, session=session, source_hub_id=hub_id
+                )
+            blocking = [
+                i for i in ref_issues
+                if i.code in ("HUB_LINK_REQUIRED", "HUB_LINK_REVOKED", "REFERENCE_TARGET_MISSING")
+            ]
+            if blocking:
+                issue = blocking[0]
+                error_info = {"code": issue.code, "message": issue.message, "node_id": issue.node_id}
+                run_status = "failed"
+                return
 
-            queue = [nid for nid in node_map if in_degree[nid] == 0]
-            if not queue and node_map:
-                queue = list(node_map.keys())
+            # Check cancellation before long invocation
+            if run_id in _CANCELLED_RUNS:
+                run_status = "cancelled"
+                return
 
-            visited = set()
-            while queue:
+            # ------------------------------------------------------------------
+            # Emit node_start events in topo order, then invoke the full graph.
+            # Per-node SSE events reflect the logical execution order rather
+            # than actual async scheduling (which LangGraph handles internally).
+            # ------------------------------------------------------------------
+            seq = 0
+            node_start_times: Dict[str, datetime] = {}
+
+            for nid in topo_order:
                 if run_id in _CANCELLED_RUNS:
                     run_status = "cancelled"
                     return
-
-                curr_id = queue.pop(0)
-                if curr_id in visited:
-                    continue
-                visited.add(curr_id)
-
-                curr_node = node_map[curr_id]
-                ntype = curr_node.get("type", "AgentNode")
-
-                node_start_time = datetime.utcnow()
+                node_start_times[nid] = datetime.utcnow()
+                ntype = node_map[nid].get("type", "AgentNode") if nid in node_map else "unknown"
                 _publish_event(
                     run_id,
                     "node_start",
                     {
                         "run_id": run_id,
-                        "node_id": curr_id,
+                        "node_id": nid,
                         "node_type": ntype,
                         "sequence": seq,
-                        "started_at": node_start_time.isoformat(),
+                        "started_at": node_start_times[nid].isoformat(),
                     },
                 )
+                seq += 1
 
-                # Re-validate qualified reference at node execution time
-                async with session_factory() as session:
-                    parser = GraphParser(graph_json)
-                    single_node_graph = {"nodes": [curr_node], "edges": []}
-                    ref_issues = await parser.validate_references(single_node_graph, session=session, source_hub_id=hub_id)
-                    if any(i.code in ("HUB_LINK_REQUIRED", "HUB_LINK_REVOKED") for i in ref_issues):
-                        ref_obj = curr_node.get("data", {}).get("reference", {})
-                        target_hub = ref_obj.get("hub_id", "unknown")
-                        res_id = ref_obj.get("resource_id", "unknown")
-                        err_msg = f"HUB_LINK_REVOKED: node {curr_id} references {target_hub}/{res_id}"
-                        error_info = {"code": "HUB_LINK_REVOKED", "message": err_msg, "node_id": curr_id}
-                        run_status = "failed"
-                        return
+            # ------------------------------------------------------------------
+            # Execute the compiled LangGraph
+            # ------------------------------------------------------------------
+            try:
+                invocation_start = datetime.utcnow()
+                final_state = await compiled_graph.ainvoke(initial_state)
+                invocation_end = datetime.utcnow()
+            except Exception as graph_exc:
+                run_status = "failed"
+                error_info = {
+                    "code": "GRAPH_EXECUTION_ERROR",
+                    "message": str(graph_exc),
+                    "node_id": None,
+                }
+                logger.exception("LangGraph invocation failed for run %s", run_id)
+                return
 
-                node_latency = (datetime.utcnow() - node_start_time).total_seconds() * 1000.0
-                node_output = {"result": f"Executed {ntype} {curr_id}", "status": "completed"}
-                current_state[f"{curr_id}_output"] = node_output
-                output_data = current_state
+            output_data = dict(final_state)
 
-                redacted_in = redact_secrets(current_state)
+            # ------------------------------------------------------------------
+            # Emit node_end events + persist WorkflowRunStep per node
+            # ------------------------------------------------------------------
+            total_duration_s = (invocation_end - invocation_start).total_seconds()
+            per_node_ms = (
+                (total_duration_s * 1000.0 / len(topo_order)) if topo_order else 0.0
+            )
+
+            for i, nid in enumerate(topo_order):
+                if nid not in node_map:
+                    continue
+                ntype = node_map[nid].get("type", "AgentNode")
+                node_start = node_start_times.get(nid, invocation_start)
+                node_latency = per_node_ms
+                node_finish = datetime.utcnow()
+
+                # Extract per-node output from final_state where possible
+                node_output: Dict[str, Any] = {}
+                for key in (
+                    "subagent_results",
+                    "transform_outputs",
+                    "webhook_results",
+                    "api_call_results",
+                    "eval_results",
+                    "mcp_tool_results",
+                ):
+                    if nid in final_state.get(key, {}):
+                        node_output[key] = final_state[key][nid]
+
+                # Include final_response on last node
+                if i == len(topo_order) - 1 and final_state.get("final_response"):
+                    node_output["final_response"] = final_state["final_response"]
+
+                node_error = final_state.get("errors", {}).get(nid)
+                node_status = "failed" if node_error else "succeeded"
+
+                # Expose per-node output under {node_id}_output for downstream
+                # consumers (matches the pre-LangGraph run contract).
+                output_data[f"{nid}_output"] = node_output
+
+                redacted_in = redact_secrets(dict(initial_state))
                 redacted_out = redact_secrets(node_output)
-
-                global_trace_collector.emit_event(
-                    {
-                        "hub_id": hub_id,
-                        "run_id": run_id,
-                        "workflow_id": workflow_id,
-                        "node_id": curr_id,
-                        "node_type": ntype,
-                        "sequence": seq,
-                        "input_state": redacted_in,
-                        "output_state": redacted_out,
-                        "latency_ms": node_latency,
-                        "timestamp": datetime.utcnow(),
-                    }
-                )
 
                 out_str = json.dumps(redacted_out)
                 out_preview = out_str[:2000] if len(out_str) > 2000 else out_str
+
                 _publish_event(
                     run_id,
                     "node_end",
                     {
                         "run_id": run_id,
-                        "node_id": curr_id,
-                        "status": "succeeded",
+                        "node_id": nid,
+                        "node_type": ntype,
+                        "status": node_status,
                         "latency_ms": node_latency,
                         "output_preview": out_preview,
-                        "sequence": seq,
+                        "sequence": i,
                     },
                 )
-                seq += 1
 
-                for nxt in adj[curr_id]:
-                    in_degree[nxt] -= 1
-                    if in_degree[nxt] == 0 and nxt not in visited:
-                        queue.append(nxt)
+                # EvalFlowTrace emission (existing infrastructure)
+                global_trace_collector.emit_event(
+                    {
+                        "hub_id": hub_id,
+                        "run_id": run_id,
+                        "workflow_id": workflow_id,
+                        "node_id": nid,
+                        "node_type": ntype,
+                        "sequence": i,
+                        "input_state": redacted_in,
+                        "output_state": redacted_out,
+                        "latency_ms": node_latency,
+                        "timestamp": node_finish,
+                    }
+                )
+
+                # Persist WorkflowRunStep
+                asyncio.create_task(
+                    _persist_run_step(
+                        session_factory,
+                        hub_id=hub_id,
+                        run_id=run_id,
+                        workflow_id=workflow_id,
+                        node_id=nid,
+                        node_type=ntype,
+                        sequence=i,
+                        status=node_status,
+                        input_state=redacted_in,
+                        output_state=redacted_out,
+                        error_json={"error": str(node_error)} if node_error else None,
+                        started_at=node_start,
+                        finished_at=node_finish,
+                        latency_ms=node_latency,
+                    )
+                )
 
         await asyncio.wait_for(_run_inner(), timeout=float(timeout_s))
 
@@ -446,7 +651,19 @@ async def get_run(session: AsyncSession, *, hub_id: str, run_id: str) -> Workflo
     run = (await session.execute(stmt)).scalar_one_or_none()
     if not run:
         raise RunNotFoundError(f"Workflow run '{run_id}' not found in hub '{hub_id}'.")
-    return WorkflowRunDetail.model_validate(run)
+
+    from sqlalchemy import select as sa_select
+    from common.models.database import WorkflowRunStep as WRStep
+    steps_stmt = (
+        sa_select(WRStep)
+        .where(WRStep.hub_id == hub_id, WRStep.run_id == run_id)
+        .order_by(WRStep.sequence)
+    )
+    steps = (await session.execute(steps_stmt)).scalars().all()
+
+    detail = WorkflowRunDetail.model_validate(run)
+    detail.steps = [WorkflowRunStepSummary.model_validate(s) for s in steps]
+    return detail
 
 
 async def list_runs(

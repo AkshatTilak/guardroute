@@ -54,6 +54,8 @@ from projects.guardroute.src.nodes.transform_executor import execute_transform
 from projects.guardroute.src.nodes.multi_agent_executor import execute_multi_agent
 from projects.guardroute.src.nodes.action_executor import execute_action_node
 from projects.guardroute.src.nodes.final_message_executor import execute_final_message_node
+from projects.guardroute.src.nodes.db_query_executor import execute_database_query_node
+from projects.guardroute.src.nodes.db_store_executor import execute_db_store_node
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from common.schemas.workflows import NodeReference, ValidationIssue, ValidationResult
@@ -70,6 +72,10 @@ NODE_REFERENCE_REQUIREMENTS: Dict[str, str] = {
     "retrieval": "collection",
     "MCPToolNode": "mcp_tool",
     "mcp_tool": "mcp_tool",
+    "DatabaseQueryNode": "credential",
+    "database_query": "credential",
+    "DBStoreNode": "credential",
+    "db_store": "credential",
 }
 
 
@@ -145,7 +151,10 @@ class GraphParser:
         # Evaluation V5
         "EvalNode", "eval",
         # Tools V5
-        "MCPToolNode", "mcp_tool"
+        "MCPToolNode", "mcp_tool",
+        # Database V7
+        "DatabaseQueryNode", "database_query",
+        "DBStoreNode", "db_store",
     }
 
     TERMINAL_NODE_TYPES = {
@@ -222,6 +231,26 @@ class GraphParser:
 
         return True
 
+    def _guard_node(self, node_id: str, fn: Any) -> Any:
+        """Wrap a node function so exceptions are captured into state['errors'][node_id].
+
+        This enables error-handle fallback routing: instead of propagating the
+        exception (which would abort the whole run), the error is recorded in
+        state['errors'] and the graph can transition along an 'error' handle.
+        """
+        async def _wrapped(state: GraphState) -> Dict[str, Any]:
+            try:
+                result = await fn(state)
+                if result is None:
+                    result = {}
+                return result
+            except Exception as exc:  # noqa: BLE001 - capture any node failure
+                logger.warning("Node '%s' raised %s: %s", node_id, type(exc).__name__, exc)
+                errors = dict(state.get("errors", {}) or {})
+                errors[node_id] = {"type": type(exc).__name__, "message": str(exc)}
+                return {"errors": errors}
+        return _wrapped
+
     def build_langgraph(self, graph_json: Optional[Dict[str, Any]] = None) -> Any:
         """Converts validated visual graph JSON into a compiled LangGraph StateGraph executable."""
         data = graph_json or self.graph_json
@@ -265,19 +294,19 @@ class GraphParser:
             elif ntype in {"MultiAgentNode", "multi_agent"}:
                 async def _multi_agent_fn(state: GraphState, cfg=data_cfg):
                     return await execute_multi_agent(cfg, state)
-                workflow.add_node(nid, _multi_agent_fn)
+                workflow.add_node(nid, self._guard_node(nid, _multi_agent_fn))
 
             # V5 Terminal Nodes
             elif ntype in {"ActionNode", "action"}:
                 async def _action_fn(state: GraphState, cfg=data_cfg):
                     return await execute_action_node(cfg, state)
-                workflow.add_node(nid, _action_fn)
+                workflow.add_node(nid, self._guard_node(nid, _action_fn))
                 terminal_node_ids.add(nid)
 
             elif ntype in {"FinalMessageNode", "final_message"}:
                 async def _final_message_fn(state: GraphState, cfg=data_cfg):
                     return await execute_final_message_node(cfg, state)
-                workflow.add_node(nid, _final_message_fn)
+                workflow.add_node(nid, self._guard_node(nid, _final_message_fn))
                 terminal_node_ids.add(nid)
 
             # V5 Logic Nodes
@@ -288,7 +317,7 @@ class GraphParser:
                     flags = dict(state.get("conditional_flags", {}))
                     flags[nid] = result
                     return {"conditional_flags": flags}
-                workflow.add_node(nid, _if_else_fn)
+                workflow.add_node(nid, self._guard_node(nid, _if_else_fn))
 
             elif ntype in {"RouterNode", "router"}:
                 async def _router_fn(state: GraphState, cfg=data_cfg):
@@ -298,7 +327,7 @@ class GraphParser:
                     flags = dict(state.get("conditional_flags", {}))
                     flags[nid] = selected
                     return {"conditional_flags": flags}
-                workflow.add_node(nid, _router_fn)
+                workflow.add_node(nid, self._guard_node(nid, _router_fn))
 
             elif ntype in {"TransformNode", "transform"}:
                 async def _transform_fn(state: GraphState, cfg=data_cfg):
@@ -306,7 +335,7 @@ class GraphParser:
                     outputs = dict(state.get("transform_outputs", {}))
                     outputs[nid] = res.get("output")
                     return {"transform_outputs": outputs}
-                workflow.add_node(nid, _transform_fn)
+                workflow.add_node(nid, self._guard_node(nid, _transform_fn))
 
             # V5 Integration Nodes
             elif ntype in {"WebhookNode", "webhook"}:
@@ -315,7 +344,7 @@ class GraphParser:
                     wh_results = dict(state.get("webhook_results", {}))
                     wh_results[nid] = res
                     return {"webhook_results": wh_results}
-                workflow.add_node(nid, _webhook_fn)
+                workflow.add_node(nid, self._guard_node(nid, _webhook_fn))
 
             elif ntype in {"APICallNode", "api_call"}:
                 async def _api_call_fn(state: GraphState, cfg=data_cfg):
@@ -323,7 +352,7 @@ class GraphParser:
                     api_results = dict(state.get("api_call_results", {}))
                     api_results[nid] = res
                     return {"api_call_results": api_results}
-                workflow.add_node(nid, _api_call_fn)
+                workflow.add_node(nid, self._guard_node(nid, _api_call_fn))
 
             # V5 Evaluation Node
             elif ntype in {"EvalNode", "eval"}:
@@ -332,7 +361,7 @@ class GraphParser:
                     eval_res = dict(state.get("eval_results", {}))
                     eval_res[nid] = res
                     return {"eval_results": eval_res}
-                workflow.add_node(nid, _eval_fn)
+                workflow.add_node(nid, self._guard_node(nid, _eval_fn))
 
             # V5 Tools Node
             elif ntype in {"MCPToolNode", "mcp_tool"}:
@@ -341,7 +370,24 @@ class GraphParser:
                     mcp_res = dict(state.get("mcp_tool_results", {}))
                     mcp_res[nid] = res
                     return {"mcp_tool_results": mcp_res}
-                workflow.add_node(nid, _mcp_fn)
+                workflow.add_node(nid, self._guard_node(nid, _mcp_fn))
+
+            # V7 Database Nodes
+            elif ntype in {"DatabaseQueryNode", "database_query"}:
+                async def _db_query_fn(state: GraphState, cfg=data_cfg):
+                    res = await execute_database_query_node(cfg, state, hub_id=state.get("hub_id"))
+                    db_res = dict(state.get("db_query_results", {}))
+                    db_res[nid] = res
+                    return {"db_query_results": db_res}
+                workflow.add_node(nid, self._guard_node(nid, _db_query_fn))
+
+            elif ntype in {"DBStoreNode", "db_store"}:
+                async def _db_store_fn(state: GraphState, cfg=data_cfg):
+                    res = await execute_db_store_node(cfg, state, hub_id=state.get("hub_id"))
+                    db_res = dict(state.get("db_store_results", {}))
+                    db_res[nid] = res
+                    return {"db_store_results": db_res}
+                workflow.add_node(nid, self._guard_node(nid, _db_store_fn))
 
             else:
                 # Fallback AgentNode
@@ -355,11 +401,93 @@ class GraphParser:
 
         workflow.set_entry_point(entry_node_id)
 
-        # Wire edges
+        # ------------------------------------------------------------------
+        # Wire edges with handle-level routing.
+        #
+        # Handles:
+        #   - IfElseNode / RouterNode: sourceHandle "true"/"false" or "route_<name>"
+        #     route conditionally based on state["conditional_flags"][node_id].
+        #   - Any node: sourceHandle "error" routes to a fallback branch when
+        #     state["errors"][node_id] is set (error-handle fallback).
+        #   - Everything else: unconditional add_edge.
+        # ------------------------------------------------------------------
+        # Group outgoing edges by (source, sourceHandle).
+        from collections import defaultdict
+        out_edges: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for edge in edges:
             src = edge.get("source")
-            tgt = edge.get("target")
-            if src in node_map and tgt in node_map:
+            if src in node_map:
+                out_edges[src].append(edge)
+
+        def _is_conditional_source(ntype: str) -> bool:
+            return ntype in {"IfElseNode", "if_else", "RouterNode", "router"}
+
+        for src, src_edges in out_edges.items():
+            src_type = node_map.get(src, "AgentNode")
+
+            # --- Conditional branching (IfElse / Router) ---
+            if _is_conditional_source(src_type):
+                # Map handle -> target node id
+                handle_targets: Dict[str, str] = {}
+                for e in src_edges:
+                    handle = e.get("sourceHandle") or "out"
+                    tgt = e.get("target")
+                    if tgt in node_map:
+                        handle_targets[handle] = tgt
+
+                if not handle_targets:
+                    continue
+
+                def _make_conditional_path(node_id: str, targets: Dict[str, str]):
+                    async def _path(state: GraphState) -> str:
+                        flags = state.get("conditional_flags", {}) or {}
+                        selected = flags.get(node_id)
+                        # RouterNode stores a route name string; IfElse stores a bool.
+                        if isinstance(selected, bool):
+                            return "true" if selected else "false"
+                        # Router: match route_<name> handle, fall back to default/out.
+                        route_key = f"route_{selected}" if selected else "out"
+                        if route_key in targets:
+                            return route_key
+                        if "default" in targets:
+                            return "default"
+                        return "out"
+                    return _path
+
+                path_fn = _make_conditional_path(src, handle_targets)
+                workflow.add_conditional_edges(src, path_fn, handle_targets)
+                continue
+
+            # --- Error-handle fallback ---
+            error_target = None
+            normal_targets: List[str] = []
+            for e in src_edges:
+                handle = e.get("sourceHandle") or "out"
+                tgt = e.get("target")
+                if tgt not in node_map:
+                    continue
+                if handle == "error":
+                    error_target = tgt
+                else:
+                    normal_targets.append(tgt)
+
+            if error_target is not None:
+                def _make_error_path(node_id: str):
+                    async def _path(state: GraphState) -> str:
+                        errors = state.get("errors", {}) or {}
+                        if errors.get(node_id):
+                            return "error"
+                        return "ok"
+                    return _path
+
+                path_map: Dict[str, str] = {"error": error_target}
+                if normal_targets:
+                    path_map["ok"] = normal_targets[0]
+                workflow.add_conditional_edges(src, _make_error_path(src), path_map)
+                continue
+
+            # --- Unconditional edges ---
+            for tgt in normal_targets:
                 workflow.add_edge(src, tgt)
 
         # Connect terminal nodes to END

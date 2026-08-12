@@ -53,6 +53,12 @@ class GraphState(TypedDict):
     transform_outputs: Dict[str, Any]
     mcp_tool_results: Dict[str, Any]
     conditional_flags: Dict[str, bool]
+    # V7: per-node error capture for error-handle fallback routing
+    errors: Dict[str, Any]
+    # V7: external database node results
+    db_query_results: Dict[str, Any]
+    db_store_results: Dict[str, Any]
+    hub_id: str
 
 
 # --- Helper to retrieve Redis and DB connection ---
