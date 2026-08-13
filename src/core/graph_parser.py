@@ -48,14 +48,12 @@ from projects.guardroute.src.nodes.conditional_evaluator import evaluate_conditi
 from projects.guardroute.src.nodes.webhook_executor import execute_webhook
 from projects.guardroute.src.nodes.api_call_executor import execute_api_call
 from projects.guardroute.src.nodes.eval_executor import execute_eval_node
-from projects.guardroute.src.nodes.mcp_tool_executor import execute_mcp_tool
 from projects.guardroute.src.nodes.router_executor import evaluate_routes
 from projects.guardroute.src.nodes.transform_executor import execute_transform
 from projects.guardroute.src.nodes.multi_agent_executor import execute_multi_agent
 from projects.guardroute.src.nodes.action_executor import execute_action_node
 from projects.guardroute.src.nodes.final_message_executor import execute_final_message_node
-from projects.guardroute.src.nodes.db_query_executor import execute_database_query_node
-from projects.guardroute.src.nodes.db_store_executor import execute_db_store_node
+from projects.guardroute.src.nodes.tool_executor import execute_agent_tools
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from common.schemas.workflows import NodeReference, ValidationIssue, ValidationResult
@@ -68,15 +66,47 @@ NODE_REFERENCE_REQUIREMENTS: Dict[str, str] = {
     "AgentNode": "agent",
     "agent": "agent",
     "MultiAgentNode": "agent",  # list-valued in data["references"]
-    "RetrievalNode": "collection",
-    "retrieval": "collection",
-    "MCPToolNode": "mcp_tool",
-    "mcp_tool": "mcp_tool",
-    "DatabaseQueryNode": "credential",
-    "database_query": "credential",
-    "DBStoreNode": "credential",
-    "db_store": "credential",
 }
+
+
+def collect_tool_references(graph_json: Dict[str, Any]) -> List[tuple[str, NodeReference]]:
+    """Extract (node_id, NodeReference) pairs from agent-node tool bindings.
+
+    Vector retrieval, MCP, and DB capabilities are now tools bound to agent
+    nodes. Each tool binding is resolved as a cross-hub reference so the
+    underlying resource (collection / MCP tool / credential) can be validated
+    and linked.
+    """
+    refs: List[tuple[str, NodeReference]] = []
+    nodes = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
+    for node in nodes:
+        nid = node.get("id")
+        if not nid:
+            continue
+        ntype = node.get("type")
+        if ntype not in {"AgentNode", "agent", "MultiAgentNode", "multi_agent"}:
+            continue
+        data_cfg = node.get("data", {})
+        tools = data_cfg.get("tools") or []
+        if not isinstance(tools, list):
+            continue
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            ttype = tool.get("type")
+            try:
+                if ttype == "retrieval":
+                    refs.append((nid, NodeReference(
+                        type="collection", hub_id=tool["hub_id"], resource_id=tool["collection_id"])))
+                elif ttype == "mcp":
+                    refs.append((nid, NodeReference(
+                        type="mcp_tool", hub_id=tool.get("hub_id") or "", resource_id=tool["tool_name"])))
+                elif ttype == "db":
+                    refs.append((nid, NodeReference(
+                        type="credential", hub_id=tool.get("hub_id") or "", resource_id=tool["credential_id"])))
+            except (KeyError, TypeError):
+                continue
+    return refs
 
 
 def collect_references(graph_json: Dict[str, Any]) -> List[tuple[str, NodeReference]]:
@@ -134,7 +164,6 @@ class GraphParser:
         "ClassifierNode", "classifier",
         "AgentNode", "agent",
         "MultiAgentNode", "multi_agent",
-        "RetrievalNode", "retrieval",
         "CodingNode", "coding",
         "WebSearchNode", "web_search",
         "SynthesisNode", "synthesis",
@@ -150,9 +179,15 @@ class GraphParser:
         "APICallNode", "api_call",
         # Evaluation V5
         "EvalNode", "eval",
-        # Tools V5
+    }
+
+    # Node types that were removed as standalone flow steps. Vector retrieval,
+    # MCP tools, and external database access are now capabilities (tools) bound
+    # to an agent node, not standalone nodes. Any graph still using them is
+    # rejected with a clear, actionable validation error.
+    REMOVED_NODE_TYPES = {
+        "RetrievalNode", "retrieval",
         "MCPToolNode", "mcp_tool",
-        # Database V7
         "DatabaseQueryNode", "database_query",
         "DBStoreNode", "db_store",
     }
@@ -186,6 +221,16 @@ class GraphParser:
 
         node_map = {node["id"]: node for node in nodes if "id" in node}
         node_ids = set(node_map.keys())
+
+        # Reject removed standalone tool node types with an actionable message.
+        for node in nodes:
+            ntype = node.get("type", "AgentNode")
+            if ntype in self.REMOVED_NODE_TYPES:
+                raise GraphValidationError(
+                    f"Node '{node.get('id')}' uses removed node type '{ntype}'. "
+                    "Vector retrieval, MCP tools, and external database access are no longer standalone "
+                    "nodes — attach them as tools to an Agent node instead (agent node 'tools' bindings)."
+                )
 
         # Check edge validity
         adj: Dict[str, List[str]] = {nid: [] for nid in node_ids}
@@ -280,8 +325,6 @@ class GraphParser:
                 workflow.add_node(nid, classify_node)
                 if not entry_node_id:
                     entry_node_id = nid
-            elif ntype in {"RetrievalNode", "retrieval"}:
-                workflow.add_node(nid, retrieval_node)
             elif ntype in {"CodingNode", "coding"}:
                 workflow.add_node(nid, coding_node)
             elif ntype in {"WebSearchNode", "web_search"}:
@@ -363,31 +406,16 @@ class GraphParser:
                     return {"eval_results": eval_res}
                 workflow.add_node(nid, self._guard_node(nid, _eval_fn))
 
-            # V5 Tools Node
-            elif ntype in {"MCPToolNode", "mcp_tool"}:
-                async def _mcp_fn(state: GraphState, cfg=data_cfg):
-                    res = await execute_mcp_tool(cfg, state)
-                    mcp_res = dict(state.get("mcp_tool_results", {}))
-                    mcp_res[nid] = res
-                    return {"mcp_tool_results": mcp_res}
-                workflow.add_node(nid, self._guard_node(nid, _mcp_fn))
-
-            # V7 Database Nodes
-            elif ntype in {"DatabaseQueryNode", "database_query"}:
-                async def _db_query_fn(state: GraphState, cfg=data_cfg):
-                    res = await execute_database_query_node(cfg, state, hub_id=state.get("hub_id"))
-                    db_res = dict(state.get("db_query_results", {}))
-                    db_res[nid] = res
-                    return {"db_query_results": db_res}
-                workflow.add_node(nid, self._guard_node(nid, _db_query_fn))
-
-            elif ntype in {"DBStoreNode", "db_store"}:
-                async def _db_store_fn(state: GraphState, cfg=data_cfg):
-                    res = await execute_db_store_node(cfg, state, hub_id=state.get("hub_id"))
-                    db_res = dict(state.get("db_store_results", {}))
-                    db_res[nid] = res
-                    return {"db_store_results": db_res}
-                workflow.add_node(nid, self._guard_node(nid, _db_store_fn))
+            # Agent node: invokes its bound tools (retrieval / mcp / db /
+            # web_search / api_call) during the agent turn.
+            elif ntype in {"AgentNode", "agent"}:
+                async def _agent_fn(state: GraphState, cfg=data_cfg):
+                    tools = cfg.get("tools") or []
+                    tool_out = await execute_agent_tools(tools, state)
+                    tool_results = dict(state.get("tool_results", {}))
+                    tool_results[nid] = tool_out
+                    return {"tool_results": tool_results}
+                workflow.add_node(nid, self._guard_node(nid, _agent_fn))
 
             else:
                 # Fallback AgentNode
@@ -642,6 +670,42 @@ class GraphParser:
                     issues=issues,
                 )
 
+        # Validate agent-node tool bindings as cross-hub references.
+        for node in nodes:
+            nid = node.get("id")
+            ntype = node.get("type", "")
+            if ntype not in {"AgentNode", "agent", "MultiAgentNode", "multi_agent"}:
+                continue
+            data_cfg = node.get("data", {})
+            tools = data_cfg.get("tools") or []
+            if not isinstance(tools, list):
+                continue
+            for idx, tool in enumerate(tools):
+                if not isinstance(tool, dict):
+                    continue
+                ttype = tool.get("type")
+                field = f"data.tools[{idx}]"
+                try:
+                    if ttype == "retrieval":
+                        nr = NodeReference(type="collection", hub_id=tool["hub_id"], resource_id=tool["collection_id"])
+                    elif ttype == "mcp":
+                        nr = NodeReference(type="mcp_tool", hub_id=tool.get("hub_id") or "", resource_id=tool["tool_name"])
+                    elif ttype == "db":
+                        nr = NodeReference(type="credential", hub_id=tool.get("hub_id") or "", resource_id=tool["credential_id"])
+                    else:
+                        continue
+                except (KeyError, TypeError):
+                    continue
+                await self._check_single_reference(
+                    session=session,
+                    source_hub_id=source_hub_id,
+                    nid=nid,
+                    ntype=ntype,
+                    field=field,
+                    nr=nr,
+                    issues=issues,
+                )
+
         return issues
 
     async def _check_single_reference(
@@ -746,7 +810,7 @@ class GraphParser:
             return
 
         res_hub_id = getattr(res_obj, "hub_id", None)
-        if res_hub_id and res_hub_id != nr.hub_id:
+        if res_hub_id and nr.hub_id and nr.hub_id != res_hub_id and nr.hub_id != source_hub_id:
             issues.append(
                 ValidationIssue(
                     node_id=nid,
@@ -808,6 +872,107 @@ async def validate_workflow_graph(
     else:
         node_map = {node["id"]: node for node in nodes if "id" in node}
         node_ids = set(node_map.keys())
+
+        # Reject removed standalone tool node types with an actionable message.
+        for node in nodes:
+            ntype = node.get("type", "AgentNode")
+            if ntype in GraphParser.REMOVED_NODE_TYPES:
+                errors.append(
+                    ValidationIssue(
+                        node_id=node.get("id"),
+                        node_type=ntype,
+                        code="REMOVED_NODE_TYPE",
+                        level="error",
+                        message=(
+                            f"Node '{node.get('id')}' uses removed node type '{ntype}'. "
+                            "Vector retrieval, MCP tools, and external database access are no longer standalone "
+                            "nodes — attach them as tools to an Agent node instead (agent node 'tools' bindings)."
+                        ),
+                    )
+                )
+
+        # Validate agent-node tool bindings.
+        for node in nodes:
+            ntype = node.get("type", "AgentNode")
+            if ntype not in {"AgentNode", "agent", "MultiAgentNode", "multi_agent"}:
+                continue
+            nid = node.get("id")
+            tools = (node.get("data") or {}).get("tools") or []
+            if not isinstance(tools, list):
+                continue
+            for idx, tool in enumerate(tools):
+                if not isinstance(tool, dict):
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="MALFORMED_TOOL",
+                            level="error",
+                            message=f"Agent node '{nid}' tool at index {idx} is not an object.",
+                            field=f"data.tools[{idx}]",
+                        )
+                    )
+                    continue
+                ttype = tool.get("type")
+                if ttype not in {"retrieval", "mcp", "db", "web_search", "api_call"}:
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="UNKNOWN_TOOL_TYPE",
+                            level="error",
+                            message=(
+                                f"Agent node '{nid}' tool at index {idx} has unknown type '{ttype}'. "
+                                "Allowed tool types: retrieval, mcp, db, web_search, api_call."
+                            ),
+                            field=f"data.tools[{idx}].type",
+                        )
+                    )
+                    continue
+                if ttype == "retrieval" and not (tool.get("hub_id") and tool.get("collection_id")):
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="TOOL_MISSING_REF",
+                            level="error",
+                            message=f"Agent node '{nid}' retrieval tool requires hub_id and collection_id.",
+                            field=f"data.tools[{idx}]",
+                        )
+                    )
+                elif ttype == "mcp" and not (tool.get("server_id") and tool.get("tool_name")):
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="TOOL_MISSING_REF",
+                            level="error",
+                            message=f"Agent node '{nid}' mcp tool requires server_id and tool_name.",
+                            field=f"data.tools[{idx}]",
+                        )
+                    )
+                elif ttype == "db" and not tool.get("credential_id"):
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="TOOL_MISSING_REF",
+                            level="error",
+                            message=f"Agent node '{nid}' db tool requires credential_id.",
+                            field=f"data.tools[{idx}]",
+                        )
+                    )
+                elif ttype == "api_call" and not tool.get("url"):
+                    errors.append(
+                        ValidationIssue(
+                            node_id=nid,
+                            node_type=ntype,
+                            code="TOOL_MISSING_REF",
+                            level="error",
+                            message=f"Agent node '{nid}' api_call tool requires url.",
+                            field=f"data.tools[{idx}]",
+                        )
+                    )
 
         adj: Dict[str, List[str]] = {nid: [] for nid in node_ids}
         in_degree: Dict[str, int] = {nid: 0 for nid in node_ids}

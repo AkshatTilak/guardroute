@@ -58,6 +58,8 @@ class GraphState(TypedDict):
     # V7: external database node results
     db_query_results: Dict[str, Any]
     db_store_results: Dict[str, Any]
+    # V7: agent-node tool binding results (retrieval / mcp / db / web_search / api_call)
+    tool_results: Dict[str, Any]
     hub_id: str
 
 
