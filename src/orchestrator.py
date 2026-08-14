@@ -61,6 +61,7 @@ class GraphState(TypedDict):
     # V7: agent-node tool binding results (retrieval / mcp / db / web_search / api_call)
     tool_results: Dict[str, Any]
     hub_id: str
+    session_factory: Optional[Any]
 
 
 # --- Helper to retrieve Redis and DB connection ---
@@ -91,7 +92,7 @@ def publish_trace_to_kafka(trace_data: Dict[str, Any]) -> None:
                 key=str(trace_data.get("session_id", time.time())),
                 value=json.dumps(trace_data)
             )
-            producer.flush()
+            producer.flush(1.0)
             logger.info("Trace event successfully published to Kafka: guardroute-traces")
             return
     except Exception as e:

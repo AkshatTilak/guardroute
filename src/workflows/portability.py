@@ -268,6 +268,7 @@ async def import_workflow(
         created_at=datetime.utcnow(),
     )
     session.add(ver)
+    await session.flush()
     wf.draft_version_id = ver_id
     await session.commit()
     return wf

@@ -199,8 +199,9 @@ class GraphParser:
         "GatherNode", "gather",
     }
 
-    def __init__(self, graph_json: Optional[Dict[str, Any]] = None):
+    def __init__(self, graph_json: Optional[Dict[str, Any]] = None, session_factory: Optional[Any] = None):
         self.graph_json = graph_json or {}
+        self.session_factory = session_factory
 
     def validate_graph(self, graph_json: Optional[Dict[str, Any]] = None) -> bool:
         """Validates ReactFlow JSON topology for safety constraints.
@@ -354,66 +355,69 @@ class GraphParser:
 
             # V5 Logic Nodes
             elif ntype in {"IfElseNode", "if_else"}:
-                async def _if_else_fn(state: GraphState, cfg=data_cfg):
+                async def _if_else_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     cond_cfg = cfg.get("condition", cfg)
                     result = evaluate_condition(cond_cfg, state)
-                    flags = dict(state.get("conditional_flags", {}))
-                    flags[nid] = result
+                    flags = dict(state.get("conditional_flags", {}) or {})
+                    flags[cur_nid] = result
                     return {"conditional_flags": flags}
                 workflow.add_node(nid, self._guard_node(nid, _if_else_fn))
 
             elif ntype in {"RouterNode", "router"}:
-                async def _router_fn(state: GraphState, cfg=data_cfg):
+                async def _router_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     routes = cfg.get("routes", [])
                     default_r = cfg.get("default_route", "default")
                     selected = evaluate_routes(routes, default_r, state)
-                    flags = dict(state.get("conditional_flags", {}))
-                    flags[nid] = selected
+                    flags = dict(state.get("conditional_flags", {}) or {})
+                    flags[cur_nid] = selected
                     return {"conditional_flags": flags}
                 workflow.add_node(nid, self._guard_node(nid, _router_fn))
 
             elif ntype in {"TransformNode", "transform"}:
-                async def _transform_fn(state: GraphState, cfg=data_cfg):
+                async def _transform_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     res = execute_transform(cfg, state)
-                    outputs = dict(state.get("transform_outputs", {}))
-                    outputs[nid] = res.get("output")
+                    outputs = dict(state.get("transform_outputs", {}) or {})
+                    outputs[cur_nid] = res.get("output")
                     return {"transform_outputs": outputs}
                 workflow.add_node(nid, self._guard_node(nid, _transform_fn))
 
             # V5 Integration Nodes
             elif ntype in {"WebhookNode", "webhook"}:
-                async def _webhook_fn(state: GraphState, cfg=data_cfg):
+                async def _webhook_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     res = await execute_webhook(cfg, state)
-                    wh_results = dict(state.get("webhook_results", {}))
-                    wh_results[nid] = res
+                    wh_results = dict(state.get("webhook_results", {}) or {})
+                    wh_results[cur_nid] = res
                     return {"webhook_results": wh_results}
                 workflow.add_node(nid, self._guard_node(nid, _webhook_fn))
 
             elif ntype in {"APICallNode", "api_call"}:
-                async def _api_call_fn(state: GraphState, cfg=data_cfg):
+                async def _api_call_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     res = await execute_api_call(cfg, state)
-                    api_results = dict(state.get("api_call_results", {}))
-                    api_results[nid] = res
+                    api_results = dict(state.get("api_call_results", {}) or {})
+                    api_results[cur_nid] = res
                     return {"api_call_results": api_results}
                 workflow.add_node(nid, self._guard_node(nid, _api_call_fn))
 
             # V5 Evaluation Node
             elif ntype in {"EvalNode", "eval"}:
-                async def _eval_fn(state: GraphState, cfg=data_cfg):
+                async def _eval_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     res = await execute_eval_node(cfg, state)
-                    eval_res = dict(state.get("eval_results", {}))
-                    eval_res[nid] = res
+                    eval_res = dict(state.get("eval_results", {}) or {})
+                    eval_res[cur_nid] = res
                     return {"eval_results": eval_res}
                 workflow.add_node(nid, self._guard_node(nid, _eval_fn))
 
             # Agent node: invokes its bound tools (retrieval / mcp / db /
             # web_search / api_call) during the agent turn.
             elif ntype in {"AgentNode", "agent"}:
-                async def _agent_fn(state: GraphState, cfg=data_cfg):
+                async def _agent_fn(state: GraphState, cur_nid=nid, cfg=data_cfg):
                     tools = cfg.get("tools") or []
-                    tool_out = await execute_agent_tools(tools, state)
-                    tool_results = dict(state.get("tool_results", {}))
-                    tool_results[nid] = tool_out
+                    state_with_sf = dict(state)
+                    if not state_with_sf.get("session_factory") and self.session_factory:
+                        state_with_sf["session_factory"] = self.session_factory
+                    tool_out = await execute_agent_tools(tools, state_with_sf)
+                    tool_results = dict(state.get("tool_results", {}) or {})
+                    tool_results[cur_nid] = tool_out
                     return {"tool_results": tool_results}
                 workflow.add_node(nid, self._guard_node(nid, _agent_fn))
 
@@ -467,19 +471,25 @@ class GraphParser:
                     continue
 
                 def _make_conditional_path(node_id: str, targets: Dict[str, str]):
-                    async def _path(state: GraphState) -> str:
+                    def _path(state: GraphState) -> str:
                         flags = state.get("conditional_flags", {}) or {}
                         selected = flags.get(node_id)
                         # RouterNode stores a route name string; IfElse stores a bool.
                         if isinstance(selected, bool):
-                            return "true" if selected else "false"
-                        # Router: match route_<name> handle, fall back to default/out.
-                        route_key = f"route_{selected}" if selected else "out"
-                        if route_key in targets:
-                            return route_key
+                            key = "true" if selected else "false"
+                            if key in targets:
+                                return key
+                        elif selected is not None:
+                            route_key = f"route_{selected}"
+                            if route_key in targets:
+                                return route_key
+                            if str(selected) in targets:
+                                return str(selected)
                         if "default" in targets:
                             return "default"
-                        return "out"
+                        if "out" in targets:
+                            return "out"
+                        return next(iter(targets.keys()))
                     return _path
 
                 path_fn = _make_conditional_path(src, handle_targets)
@@ -501,7 +511,7 @@ class GraphParser:
 
             if error_target is not None:
                 def _make_error_path(node_id: str):
-                    async def _path(state: GraphState) -> str:
+                    def _path(state: GraphState) -> str:
                         errors = state.get("errors", {}) or {}
                         if errors.get(node_id):
                             return "error"

@@ -133,7 +133,7 @@ def _compare_values(left: Any, operator: str, right: Any) -> bool:
         return False
 
 
-def evaluate_condition(condition_config: Dict[str, Any], state: Dict[str, Any]) -> bool:
+def evaluate_condition(condition_config: Any, state: Dict[str, Any]) -> bool:
     """Evaluates condition_config against graph state.
 
     Config structure:
@@ -147,6 +147,12 @@ def evaluate_condition(condition_config: Dict[str, Any], state: Dict[str, Any]) 
     """
     if not condition_config:
         return True
+
+    if isinstance(condition_config, str):
+        return _safe_eval_ast(condition_config, state)
+
+    if not isinstance(condition_config, dict):
+        return False
 
     cond_type = condition_config.get("type", "complexity_equals")
     target_value = condition_config.get("value")

@@ -68,8 +68,31 @@ class HubArchivedError(Exception):
 SECRET_KEY_PATTERN = re.compile(r"(?i)(authorization|api[_-]?key|token|password|secret)")
 
 
+def _json_sanitize(obj: Any) -> Any:
+    """Recursively sanitize objects into JSON-serializable Python primitives."""
+    if obj is None or isinstance(obj, (int, float, str, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(item) for item in obj]
+    if hasattr(obj, "content"):
+        # LangChain BaseMessage / AIMessage / HumanMessage
+        return {"role": getattr(obj, "type", "message"), "content": getattr(obj, "content", str(obj))}
+    if hasattr(obj, "model_dump"):
+        return _json_sanitize(obj.model_dump())
+    if hasattr(obj, "dict"):
+        return _json_sanitize(obj.dict())
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    return str(obj)
+
+
 def redact_secrets(obj: Any) -> Any:
     """Recursively strip secret values from dictionaries and lists, replacing values with '***'."""
+    obj = _json_sanitize(obj)
     if isinstance(obj, dict):
         new_dict = {}
         for k, v in obj.items():
@@ -90,6 +113,7 @@ global_trace_collector = TraceCollector(db_session_factory=get_sessionmaker())
 _RUN_EVENT_BUFFERS: Dict[str, List[Dict[str, Any]]] = {}
 _RUN_LISTENERS: Dict[str, Set[asyncio.Queue]] = {}
 _CANCELLED_RUNS: Set[str] = set()
+_RUN_TASKS: Dict[str, asyncio.Task] = {}
 
 
 def _publish_event(run_id: str, event_name: str, payload: Dict[str, Any]) -> None:
@@ -109,22 +133,30 @@ def _publish_event(run_id: str, event_name: str, payload: Dict[str, Any]) -> Non
 
 async def stream_run(run_id: str) -> AsyncGenerator[Dict[str, Any], None]:
     """Async generator streaming SSE events for run_id."""
+    # 1. Drain any already-buffered events
+    for evt in list(_RUN_EVENT_BUFFERS.get(run_id, [])):
+        yield evt
+        if evt.get("event") == "run_end":
+            return
+
+    # 2. Subscribe to live events
     q: asyncio.Queue = asyncio.Queue()
     if run_id not in _RUN_LISTENERS:
         _RUN_LISTENERS[run_id] = set()
     _RUN_LISTENERS[run_id].add(q)
 
     try:
-        buffered = list(_RUN_EVENT_BUFFERS.get(run_id, []))
-        for evt in buffered:
-            yield evt
-            if evt.get("event") == "run_end":
-                return
-
         while True:
-            evt = await q.get()
-            yield evt
+            try:
+                evt = await asyncio.wait_for(q.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                for b_evt in list(_RUN_EVENT_BUFFERS.get(run_id, [])):
+                    if b_evt.get("event") == "run_end":
+                        yield b_evt
+                        return
+                break
             q.task_done()
+            yield evt
             if evt.get("event") == "run_end":
                 break
     finally:
@@ -203,10 +235,16 @@ async def start_run(
     if not global_trace_collector._is_running:
         await global_trace_collector.start()
 
-    sf = session_factory or get_sessionmaker()
     if session_factory is not None:
-        global_trace_collector.db_session_factory = session_factory
-    asyncio.create_task(
+        sf = session_factory
+    elif session is not None and getattr(session, "bind", None) is not None:
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+        sf = async_sessionmaker(bind=session.bind, class_=AsyncSession, expire_on_commit=False)
+    else:
+        sf = get_sessionmaker()
+    if sf is not None:
+        global_trace_collector.db_session_factory = sf
+    task = asyncio.create_task(
         _execute_run_task(
             run_id=run_id,
             hub_id=hub_id,
@@ -219,6 +257,7 @@ async def start_run(
             session_factory=sf,
         )
     )
+    _RUN_TASKS[run_id] = task
 
     return run
 
@@ -250,9 +289,14 @@ def _seed_graph_state(input_json: Dict[str, Any]) -> Dict[str, Any]:
     state["errors"] = {}
     state["db_query_results"] = {}
     state["db_store_results"] = {}
+    state["tool_results"] = {}
+    state["session_id"] = input_json.get("session_id") or str(uuid.uuid4())
+    state["complexity"] = input_json.get("complexity", "LOW")
+    state["required_agents"] = input_json.get("required_agents", [])
+    state["token_usage"] = input_json.get("token_usage", {"input": 0, "output": 0})
     # Pass through any extra user-supplied keys
     for k, v in input_json.items():
-        if k not in ("input", "prompt"):
+        if k not in ("input", "prompt", "session_id", "complexity", "required_agents", "token_usage"):
             state[k] = v
     return state
 
@@ -334,7 +378,11 @@ async def _persist_run_step(
                 latency_ms=latency_ms,
             )
             session.add(step)
-            await session.commit()
+            await session.flush()
+            try:
+                await session.commit()
+            except Exception:
+                pass
     except Exception as exc:
         logger.warning(
             "Failed to persist WorkflowRunStep node=%s run=%s: %s",
@@ -375,10 +423,17 @@ async def _execute_run_task(
         },
     )
 
-    async with session_factory() as session:
-        stmt = update(WorkflowRun).where(WorkflowRun.id == run_id).values(status="running")
-        await session.execute(stmt)
-        await session.commit()
+    try:
+        async with session_factory() as session:
+            stmt = update(WorkflowRun).where(WorkflowRun.id == run_id).values(status="running")
+            await session.execute(stmt)
+            await session.flush()
+            try:
+                await session.commit()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("Failed to update status to running for run %s: %s", run_id, exc)
 
     run_status = "succeeded"
     error_info: Optional[Dict[str, Any]] = None
@@ -389,11 +444,12 @@ async def _execute_run_task(
         # ------------------------------------------------------------------
         # Build the compiled LangGraph from the visual graph JSON
         # ------------------------------------------------------------------
-        parser = GraphParser(graph_json)
+        parser = GraphParser(graph_json, session_factory=session_factory)
         compiled_graph = parser.build_langgraph()
 
         initial_state = _seed_graph_state(input_json)
         initial_state["hub_id"] = hub_id
+        initial_state["session_factory"] = session_factory
 
         async def _run_inner():
             nonlocal run_status, error_info, output_data, final_state
@@ -452,6 +508,7 @@ async def _execute_run_task(
                 invocation_start = datetime.utcnow()
                 final_state = await compiled_graph.ainvoke(initial_state)
                 invocation_end = datetime.utcnow()
+                run_status = "succeeded"
             except Exception as graph_exc:
                 run_status = "failed"
                 error_info = {
@@ -490,8 +547,9 @@ async def _execute_run_task(
                     "eval_results",
                     "mcp_tool_results",
                 ):
-                    if nid in final_state.get(key, {}):
-                        node_output[key] = final_state[key][nid]
+                    val = final_state.get(key)
+                    if isinstance(val, dict) and nid in val:
+                        node_output[key] = val[nid]
 
                 # Include final_response on last node
                 if i == len(topo_order) - 1 and final_state.get("final_response"):
@@ -541,23 +599,21 @@ async def _execute_run_task(
                 )
 
                 # Persist WorkflowRunStep
-                asyncio.create_task(
-                    _persist_run_step(
-                        session_factory,
-                        hub_id=hub_id,
-                        run_id=run_id,
-                        workflow_id=workflow_id,
-                        node_id=nid,
-                        node_type=ntype,
-                        sequence=i,
-                        status=node_status,
-                        input_state=redacted_in,
-                        output_state=redacted_out,
-                        error_json={"error": str(node_error)} if node_error else None,
-                        started_at=node_start,
-                        finished_at=node_finish,
-                        latency_ms=node_latency,
-                    )
+                await _persist_run_step(
+                    session_factory,
+                    hub_id=hub_id,
+                    run_id=run_id,
+                    workflow_id=workflow_id,
+                    node_id=nid,
+                    node_type=ntype,
+                    sequence=i,
+                    status=node_status,
+                    input_state=redacted_in,
+                    output_state=redacted_out,
+                    error_json={"error": str(node_error)} if node_error else None,
+                    started_at=node_start,
+                    finished_at=node_finish,
+                    latency_ms=node_latency,
                 )
 
         await asyncio.wait_for(_run_inner(), timeout=float(timeout_s))
@@ -572,21 +628,6 @@ async def _execute_run_task(
     finish_time = datetime.utcnow()
     duration_ms = int((finish_time - start_time).total_seconds() * 1000.0)
 
-    async with session_factory() as session:
-        stmt_update = (
-            update(WorkflowRun)
-            .where(WorkflowRun.id == run_id)
-            .values(
-                status=run_status,
-                error_message=error_info["message"] if error_info else None,
-                output_json=redact_secrets(output_data),
-                duration_ms=duration_ms,
-                finished_at=finish_time,
-            )
-        )
-        await session.execute(stmt_update)
-        await session.commit()
-
     _publish_event(
         run_id,
         "run_end",
@@ -599,6 +640,28 @@ async def _execute_run_task(
         },
     )
 
+    try:
+        async with session_factory() as session:
+            stmt_update = (
+                update(WorkflowRun)
+                .where(WorkflowRun.id == run_id)
+                .values(
+                    status=run_status,
+                    error_message=error_info["message"] if error_info else None,
+                    output_json=redact_secrets(output_data),
+                    duration_ms=duration_ms,
+                    finished_at=finish_time,
+                )
+            )
+            await session.execute(stmt_update)
+            await session.flush()
+            try:
+                await session.commit()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning("Failed to persist final WorkflowRun update for run %s: %s", run_id, exc)
+
 
 async def cancel_run(
     session: AsyncSession,
@@ -606,11 +669,15 @@ async def cancel_run(
     hub_id: str,
     run_id: str,
     actor_id: str,
-) -> WorkflowRun:
+) -> WorkflowRunDetail:
     """Cancel a running workflow execution."""
-    stmt = select(WorkflowRun).where(
-        WorkflowRun.hub_id == hub_id,
-        WorkflowRun.id == run_id,
+    stmt = (
+        select(WorkflowRun)
+        .where(
+            WorkflowRun.hub_id == hub_id,
+            WorkflowRun.id == run_id,
+        )
+        .execution_options(populate_existing=True)
     )
     run = (await session.execute(stmt)).scalar_one_or_none()
     if not run:
@@ -626,7 +693,11 @@ async def cancel_run(
     run.status = "cancelled"
     run.finished_at = finish_time
     run.duration_ms = duration_ms
-    await session.commit()
+    await session.flush()
+    try:
+        await session.commit()
+    except Exception:
+        pass
 
     _publish_event(
         run_id,
@@ -639,15 +710,16 @@ async def cancel_run(
             "error": None,
         },
     )
-    return run
+    return await get_run(session, hub_id=hub_id, run_id=run_id)
 
 
 async def get_run(session: AsyncSession, *, hub_id: str, run_id: str) -> WorkflowRunDetail:
     """Fetch WorkflowRunDetail enforcing hub scoping."""
+    session.expire_all()
     stmt = select(WorkflowRun).where(
         WorkflowRun.hub_id == hub_id,
         WorkflowRun.id == run_id,
-    )
+    ).execution_options(populate_existing=True)
     run = (await session.execute(stmt)).scalar_one_or_none()
     if not run:
         raise RunNotFoundError(f"Workflow run '{run_id}' not found in hub '{hub_id}'.")

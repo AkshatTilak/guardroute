@@ -37,6 +37,10 @@ class FinalMessageNodeExecutor:
 
     async def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Aggregates state context and generates final synthesized response in GraphState."""
+        static_msg = self.config.get("message")
+        if static_msg:
+            return {"final_response": static_msg, "output": static_msg}
+
         prompt = state.get("prompt", "")
         subagent_results = state.get("subagent_results", [])
 
@@ -77,7 +81,12 @@ class FinalMessageNodeExecutor:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
-            final_ans = res.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if hasattr(res, "choices") and res.choices:
+                final_ans = res.choices[0].message.content or ""
+            elif isinstance(res, dict):
+                final_ans = res.get("choices", [{}])[0].get("message", {}).get("content", "")
+            else:
+                final_ans = str(res)
             logger.info("FinalMessageNode synthesis completion generated successfully.")
             return {"final_response": final_ans}
         except Exception as e:

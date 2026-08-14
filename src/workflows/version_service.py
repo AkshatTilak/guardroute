@@ -397,16 +397,22 @@ async def restore(
 async def duplicate(
     session: AsyncSession,
     *,
-    hub_id: str,
+    hub_id: Optional[str] = None,
+    source_hub_id: Optional[str] = None,
     workflow_id: str,
-    new_name: str,
+    new_name: Optional[str] = None,
+    name_override: Optional[str] = None,
     actor_id: str,
     target_hub_id: Optional[str] = None,
 ) -> WorkflowDefinition:
     """Duplicate a workflow and its published/draft graph into a target hub."""
-    src_hub, src_wf = await _get_workflow_with_lock(session, hub_id, workflow_id, for_update=False)
+    actual_source_hub_id = source_hub_id or hub_id
+    if not actual_source_hub_id:
+        raise ValueError("source_hub_id or hub_id is required")
+    src_hub, src_wf = await _get_workflow_with_lock(session, actual_source_hub_id, workflow_id, for_update=False)
 
-    dest_hub_id = target_hub_id or hub_id
+    actual_name = name_override or new_name or f"{src_wf.name} (Copy)"
+    dest_hub_id = target_hub_id or actual_source_hub_id
     dest_hub = await _get_hub(session, dest_hub_id)
     if dest_hub.is_archived:
         raise HubArchivedError(f"Cannot duplicate workflow: Target Hub '{dest_hub_id}' is archived.")
@@ -421,7 +427,7 @@ async def duplicate(
             graph_to_copy = ver_obj.graph_json
 
     # Generate unique slug in target hub
-    base_slug = _slugify(new_name)
+    base_slug = _slugify(actual_name)
     candidate_slug = base_slug
     suffix = 1
     while True:
@@ -439,7 +445,7 @@ async def duplicate(
     new_wf = WorkflowDefinition(
         id=new_wf_id,
         hub_id=dest_hub_id,
-        name=new_name,
+        name=actual_name,
         slug=candidate_slug,
         description=f"Duplicated from {src_wf.name}",
         tags_json=src_wf.tags_json or [],
@@ -531,13 +537,14 @@ async def create_workflow(
         raise ValueError(f"WORKFLOW_SLUG_TAKEN: Workflow with slug '{slug}' already exists in hub.")
 
     wf_id = str(uuid.uuid4())
+    tags = getattr(payload, "tags_json", None) if getattr(payload, "tags_json", None) is not None else getattr(payload, "tags", []) or []
     wf = WorkflowDefinition(
         id=wf_id,
         hub_id=hub_id,
         name=name,
         slug=slug,
         description=getattr(payload, "description", None),
-        tags_json=getattr(payload, "tags", []) or [],
+        tags_json=tags,
         status="draft",
         created_by=actor_id,
         created_at=datetime.utcnow(),
@@ -547,14 +554,21 @@ async def create_workflow(
     await session.flush()
 
     ver_id = str(uuid.uuid4())
-    initial_graph = {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}}
+    raw_graph = getattr(payload, "graph", None)
+    if raw_graph is not None:
+        initial_graph = raw_graph.model_dump() if hasattr(raw_graph, "model_dump") else raw_graph
+    else:
+        initial_graph = {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}}
+
+    is_valid, val_json = await _validate_graph_payload(session, hub_id, initial_graph, strict=False)
     ver = WorkflowVersion(
         id=ver_id,
         workflow_id=wf_id,
         version_number=1,
         graph_json=initial_graph,
         change_note="Initial draft",
-        is_valid=False,
+        is_valid=is_valid,
+        validation_json=val_json,
         created_by=actor_id,
         created_at=datetime.utcnow(),
     )
@@ -601,8 +615,10 @@ async def update_workflow(
         wf.name = payload.name
     if getattr(payload, "description", None) is not None:
         wf.description = payload.description
-    if getattr(payload, "tags", None) is not None:
-        wf.tags_json = payload.tags
+    
+    tags = getattr(payload, "tags_json", None) if getattr(payload, "tags_json", None) is not None else getattr(payload, "tags", None)
+    if tags is not None:
+        wf.tags_json = tags
 
     wf.updated_at = datetime.utcnow()
     await session.commit()

@@ -55,18 +55,23 @@ async def execute_mcp_tool(config: Dict[str, Any], state: Dict[str, Any]) -> Dic
 
     start_ms = time.monotonic()
 
+    session_factory = state.get("session_factory") or get_sessionmaker()
+
     # Database MCP tools are executed by the local DB bridge (Task 12_02).
     if tool_name in _DB_TOOL_NAMES:
         hub_id = state.get("hub_id")
-        result = await execute_db_tool(tool_name, params, hub_id=hub_id)
+        result = await execute_db_tool(tool_name, params, hub_id=hub_id, session_factory=session_factory)
         exec_ms = round((time.monotonic() - start_ms) * 1000, 2)
         success = result.get("status") == "success"
         # Format tabular SQL results as a Markdown table for agent context.
         formatted = None
         if success and isinstance(result.get("result"), list):
             formatted = format_rows_as_markdown(result["result"])
+        raw_res = result.get("result")
+        row_cnt = len(raw_res) if isinstance(raw_res, list) else 0
         return {
-            "result": formatted if formatted is not None else result.get("result"),
+            "result": formatted if formatted is not None else raw_res,
+            "row_count": row_cnt,
             "success": success,
             "execution_time_ms": exec_ms,
             "error": result.get("error") if not success else None,
@@ -83,7 +88,6 @@ async def execute_mcp_tool(config: Dict[str, Any], state: Dict[str, Any]) -> Dic
         }
 
     try:
-        session_factory = get_sessionmaker()
         async with session_factory() as session:  # type: AsyncSession
             stmt = select(MCPServer).where(
                 MCPServer.id == server_id,
