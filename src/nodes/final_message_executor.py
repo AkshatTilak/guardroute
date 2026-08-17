@@ -44,7 +44,7 @@ class FinalMessageNodeExecutor:
         prompt = state.get("prompt", "")
         subagent_results = state.get("subagent_results", [])
 
-        # Gather context snippets
+        # Gather context snippets from subagent results and tool outputs
         contexts = []
         for r in subagent_results:
             if hasattr(r, "status"):
@@ -60,6 +60,23 @@ class FinalMessageNodeExecutor:
                     contexts.append(f"--- Context Source: {src} ---\n{content}")
                 elif err:
                     contexts.append(f"--- Context Source: {src} ---\nError: {err}")
+
+        # Also check direct tool_results in state
+        tool_results_dict = state.get("tool_results", {})
+        if isinstance(tool_results_dict, dict):
+            for nid, node_tool_data in tool_results_dict.items():
+                if isinstance(node_tool_data, dict):
+                    for item in node_tool_data.get("tool_results", []):
+                        if isinstance(item, dict) and item.get("success") and item.get("rows"):
+                            passages = [
+                                (row.get("text") or row.get("content") or "").strip()
+                                for row in item["rows"]
+                                if (row.get("text") or row.get("content"))
+                            ]
+                            if passages:
+                                passage_txt = "\n\n".join(passages)
+                                if not any(passage_txt in c for c in contexts):
+                                    contexts.append(f"--- Context Source: Tool Retrieval ({nid}) ---\n{passage_txt}")
 
         compiled_context = "\n\n".join(contexts) if contexts else "No prior subagent outputs."
 

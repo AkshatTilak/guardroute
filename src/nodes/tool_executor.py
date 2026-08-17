@@ -30,12 +30,25 @@ async def _run_retrieval_tool(tool: Dict[str, Any], state: Dict[str, Any]) -> Di
     query = state.get("prompt") or state.get("input") or ""
     limit = int(tool.get("limit", 5))
     try:
-        from projects.syntraflow.src.retrieval import RetrievalEngine
+        from projects.syntraflow.src.retrieval.engine import RetrievalEngine
+        from projects.syntraflow.src.database.models import SyntraFlowCollection
         from common.clients.postgres import get_sessionmaker
         SessionLocal = get_sessionmaker()
         async with SessionLocal() as db:
-            engine = RetrievalEngine(db, collection_id)
-            results = await engine.search(query=query, limit=limit)
+            if not hub_id and collection_id:
+                col_row = await db.get(SyntraFlowCollection, collection_id)
+                if col_row:
+                    hub_id = col_row.hub_id
+
+            if not hub_id:
+                return {"success": False, "rows": [], "row_count": 0, "error": "Missing hub_id for retrieval", "tool_type": "retrieval"}
+
+            engine = RetrievalEngine(db, hub_id)
+            results = await engine.search(
+                query=query,
+                collection_ids=[collection_id] if collection_id else None,
+                limit=limit,
+            )
             return {"success": True, "rows": results, "row_count": len(results), "tool_type": "retrieval"}
     except Exception as exc:  # noqa: BLE001
         logger.warning("Retrieval tool failed for collection %s: %s", collection_id, exc)

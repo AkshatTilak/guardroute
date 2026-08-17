@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.models.database import Hub, WorkflowDefinition, WorkflowVersion
+from common.models.database import Hub, WorkflowDefinition, WorkflowVersion, User
 from projects.guardroute.src.core.graph_parser import GraphValidationError, validate_workflow_graph
 
 
@@ -538,6 +538,14 @@ async def create_workflow(
 
     wf_id = str(uuid.uuid4())
     tags = getattr(payload, "tags_json", None) if getattr(payload, "tags_json", None) is not None else getattr(payload, "tags", []) or []
+
+    valid_actor = actor_id
+    if valid_actor:
+        u_res = await session.execute(select(User.id).where(User.id == valid_actor))
+        if not u_res.scalar_one_or_none():
+            admin_u = (await session.execute(select(User.id).where(User.platform_role == "admin", User.is_deleted.is_(False)))).scalars().first()
+            valid_actor = admin_u if admin_u else None
+
     wf = WorkflowDefinition(
         id=wf_id,
         hub_id=hub_id,
@@ -546,7 +554,7 @@ async def create_workflow(
         description=getattr(payload, "description", None),
         tags_json=tags,
         status="draft",
-        created_by=actor_id,
+        created_by=valid_actor,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -569,7 +577,7 @@ async def create_workflow(
         change_note="Initial draft",
         is_valid=is_valid,
         validation_json=val_json,
-        created_by=actor_id,
+        created_by=valid_actor,
         created_at=datetime.utcnow(),
     )
     session.add(ver)

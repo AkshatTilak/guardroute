@@ -418,7 +418,29 @@ class GraphParser:
                     tool_out = await execute_agent_tools(tools, state_with_sf)
                     tool_results = dict(state.get("tool_results", {}) or {})
                     tool_results[cur_nid] = tool_out
-                    return {"tool_results": tool_results}
+
+                    # Aggregate tool results into subagent_results so downstream nodes receive rich context
+                    subagents = list(state.get("subagent_results", []) or [])
+                    for t_res in tool_out.get("tool_results", []):
+                        if t_res.get("success") and t_res.get("rows"):
+                            passages = [
+                                (r.get("text") or r.get("content") or "").strip()
+                                for r in t_res["rows"]
+                                if (r.get("text") or r.get("content"))
+                            ]
+                            if passages:
+                                subagents.append({
+                                    "role": "context",
+                                    "source": f"Retrieval Tool ({t_res.get('tool_type', 'vector')})",
+                                    "content": "\n\n".join(passages),
+                                })
+                        elif t_res.get("tool_type") in ("mcp", "db", "api_call") and t_res.get("success"):
+                            subagents.append({
+                                "role": "context",
+                                "source": f"{str(t_res.get('tool_type')).upper()} Tool",
+                                "content": json.dumps(t_res),
+                            })
+                    return {"tool_results": tool_results, "subagent_results": subagents}
                 workflow.add_node(nid, self._guard_node(nid, _agent_fn))
 
             else:

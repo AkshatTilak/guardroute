@@ -131,8 +131,10 @@ def _publish_event(run_id: str, event_name: str, payload: Dict[str, Any]) -> Non
             pass
 
 
-async def stream_run(run_id: str) -> AsyncGenerator[Dict[str, Any], None]:
-    """Async generator streaming SSE events for run_id."""
+import time
+
+async def stream_run(run_id: str, max_idle_s: float = 300.0) -> AsyncGenerator[Dict[str, Any], None]:
+    """Async generator streaming SSE events for run_id with keepalive heartbeats."""
     # 1. Drain any already-buffered events
     for evt in list(_RUN_EVENT_BUFFERS.get(run_id, [])):
         yield evt
@@ -145,20 +147,26 @@ async def stream_run(run_id: str) -> AsyncGenerator[Dict[str, Any], None]:
         _RUN_LISTENERS[run_id] = set()
     _RUN_LISTENERS[run_id].add(q)
 
+    start_wait = time.time()
     try:
         while True:
             try:
-                evt = await asyncio.wait_for(q.get(), timeout=5.0)
+                evt = await asyncio.wait_for(q.get(), timeout=2.0)
+                q.task_done()
+                yield evt
+                if evt.get("event") == "run_end":
+                    break
             except asyncio.TimeoutError:
+                # Check if run_end was buffered
                 for b_evt in list(_RUN_EVENT_BUFFERS.get(run_id, [])):
                     if b_evt.get("event") == "run_end":
                         yield b_evt
                         return
-                break
-            q.task_done()
-            yield evt
-            if evt.get("event") == "run_end":
-                break
+                # Check if total idle duration exceeded
+                if time.time() - start_wait > max_idle_s:
+                    break
+                # Yield keepalive event so connection is maintained
+                yield {"event": "ping", "data": {"run_id": run_id}}
     finally:
         if run_id in _RUN_LISTENERS:
             _RUN_LISTENERS[run_id].discard(q)
