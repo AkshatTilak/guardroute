@@ -33,7 +33,7 @@ class MultiAgentExecutor:
         self.agent_id = config.get("agent_id", "sub_agent")
         self.agent_name = config.get("agent_name", self.agent_id)
         self.system_prompt = config.get("system_prompt")
-        self.model_id = config.get("model_id", "gemini/gemini-3.5-flash")
+        self.model_id = config.get("model_id", "gemini/gemma-3-27b-it")
         self.temperature = config.get("temperature", 0.7)
         self.max_tokens = config.get("max_tokens", 1000)
         self.timeout_sec = float(config.get("timeout_sec", 30.0))

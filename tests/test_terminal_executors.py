@@ -43,7 +43,7 @@ async def test_execute_action_node_ssrf_blocked():
 @pytest.mark.asyncio
 async def test_execute_final_message_node():
     config = {
-        "model_id": "gemini/gemini-3.5-flash",
+        "model_id": "gemini/gemma-3-27b-it",
         "system_prompt": "Synthesize response"
     }
     subagent_res = SubAgentResult(

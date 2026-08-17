@@ -13,7 +13,7 @@ async def test_execute_multi_agent_success():
         "agent_id": "coding_agent",
         "agent_name": "Coding Agent",
         "system_prompt": "You are a python coding sub-agent.",
-        "model_id": "gemini/gemini-3.5-flash",
+        "model_id": "gemini/gemma-3-27b-it",
     }
     state = {
         "prompt": "Write a python function to add two numbers.",

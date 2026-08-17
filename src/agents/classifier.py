@@ -163,7 +163,7 @@ async def get_cloud_classification(prompt: str) -> Dict[str, Any]:
     )
 
     response = await completion_with_fallback(
-        model="gemini/gemini-3.5-flash",
+        model="gemini/gemma-3-27b-it",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}

@@ -20,14 +20,14 @@ class FinalMessageNodeExecutor:
         """Config format:
 
         {
-            "model_id": "gemini/gemini-3.5-flash",
+            "model_id": "gemini/gemma-3-27b-it",
             "system_prompt": "You are the final synthesis node...",
             "temperature": 0.7,
             "max_tokens": 2000
         }
         """
         self.config = config
-        self.model_id = config.get("model_id", "gemini/gemini-3.5-flash")
+        self.model_id = config.get("model_id", "gemini/gemma-3-27b-it")
         self.system_prompt = config.get(
             "system_prompt",
             "You are the Final Synthesis Agent. Consolidate all gathered subagent findings and formulate a clear, factual answer to the prompt."

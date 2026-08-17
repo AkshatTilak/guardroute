@@ -87,13 +87,21 @@ async def execute_mcp_tool(config: Dict[str, Any], state: Dict[str, Any]) -> Dic
             "error": "MCPToolNode missing server_id configuration",
         }
 
+    db_sess = state.get("db_session") or state.get("session")
     try:
-        async with session_factory() as session:  # type: AsyncSession
+        if db_sess:
             stmt = select(MCPServer).where(
                 MCPServer.id == server_id,
                 MCPServer.is_active.is_(True),
             )
-            server = (await session.execute(stmt)).scalar_one_or_none()
+            server = (await db_sess.execute(stmt)).scalar_one_or_none()
+        else:
+            async with session_factory() as session:  # type: AsyncSession
+                stmt = select(MCPServer).where(
+                    MCPServer.id == server_id,
+                    MCPServer.is_active.is_(True),
+                )
+                server = (await session.execute(stmt)).scalar_one_or_none()
 
         if not server:
             logger.warning("MCP server '%s' not found or inactive", server_id)

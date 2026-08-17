@@ -355,7 +355,7 @@ async def execute_orchestrator_stream(prompt: str, session_id: Optional[str] = N
     class_latency = (time.time() - class_start) * 1000
 
     # Resolve active completion model
-    model_name = "gemini/gemini-3.5-flash"
+    model_name = "gemini/gemma-3-27b-it"
     try:
         model_spec = await get_active_model("completion")
         model_name = model_spec.model_id
